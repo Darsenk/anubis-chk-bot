@@ -1,22 +1,22 @@
 """
 ═══════════════════════════════════════════════════════════════
-BOT TELEGRAM — ANUBIS CHK
+BOT TELEGRAM — ANUBIS CHK (con Health Check HTTP)
 ═══════════════════════════════════════════════════════════════
-Comandos:
-  /start         - Bienvenida
-  /registro      - Registrarse (el admin le da usuario+pass)
-  /mislives      - Ver cuántas lives lleva
-  /usuarios      - (solo admin) Ver todos los usuarios
+Versión mejorada con:
+- Servidor HTTP para health checks (Koyeb/UptimeRobot)
+- Notificaciones garantizadas al admin
+- Mejor manejo de errores
 ═══════════════════════════════════════════════════════════════
-Ejecutar: python bot.py
 """
 
 import os
 import sys
 import time
+import json
 import requests
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Agregar carpeta padre al path para importar firebase_manager
 _BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _BASE)
 
@@ -30,42 +30,116 @@ from firebase_manager import (
 
 API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# ── Estados de conversación ───────────────────────────────────
-# {chat_id: {"step": "...", "data": {...}}}
 _estados = {}
-
-# ── Sesiones pendientes de aprobación (admin crea usuarios) ──
-# {chat_id_usuario: {"username": ..., "password": ...}}
 _pendientes = {}
 
 
-def send(chat_id, text, parse_mode="HTML"):
-    try:
-        requests.post(f"{API}/sendMessage", data={
-            "chat_id":    chat_id,
-            "text":       text,
-            "parse_mode": parse_mode,
-        }, timeout=10)
-    except Exception:
+# ══════════════════════════════════════════════════════════════
+# SERVIDOR HTTP PARA HEALTH CHECKS
+# ══════════════════════════════════════════════════════════════
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Handler HTTP minimalista para health checks"""
+    
+    def do_GET(self):
+        """Responde a GET requests de health check"""
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        
+        response = {
+            "status": "healthy",
+            "service": "ANUBIS CHK Bot",
+            "bot": "online",
+            "timestamp": int(time.time())
+        }
+        
+        self.wfile.write(json.dumps(response).encode())
+    
+    def do_HEAD(self):
+        """Responde a HEAD requests (algunos servicios lo usan)"""
+        self.send_response(200)
+        self.end_headers()
+    
+    def log_message(self, format, *args):
+        """Silenciar logs HTTP para no saturar los logs del bot"""
         pass
 
 
-def get_updates(offset=0):
+def run_http_server():
+    """
+    Inicia el servidor HTTP en el puerto configurado.
+    Koyeb/Railway/Render necesitan que la app escuche en un puerto HTTP.
+    """
+    # Usar el puerto de la variable de entorno PORT (Koyeb lo asigna automáticamente)
+    # Si no existe, usar 8080 por defecto
+    port = int(os.environ.get('PORT', 8080))
+    
     try:
-        r = requests.get(f"{API}/getUpdates", params={
-            "offset":  offset,
-            "timeout": 30,
-        }, timeout=35)
+        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        print(f"✅ HTTP Server iniciado en puerto {port}")
+        print(f"   Health check disponible en: http://0.0.0.0:{port}/")
+        server.serve_forever()
+    except Exception as e:
+        print(f"❌ Error al iniciar servidor HTTP: {e}")
+        # No detener el bot si falla el servidor HTTP
+        pass
+
+
+# ══════════════════════════════════════════════════════════════
+# FUNCIONES DEL BOT DE TELEGRAM
+# ══════════════════════════════════════════════════════════════
+def send(chat_id, text, parse_mode="HTML"):
+    """Envía mensaje de Telegram con retry automático"""
+    max_intentos = 3
+    for intento in range(max_intentos):
+        try:
+            response = requests.post(
+                f"{API}/sendMessage",
+                data={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": parse_mode,
+                },
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                return True
+            else:
+                print(f"⚠️ Error enviando mensaje (intento {intento + 1}/{max_intentos}): {response.status_code}")
+                
+        except Exception as e:
+            print(f"❌ Excepción enviando mensaje (intento {intento + 1}/{max_intentos}): {e}")
+        
+        if intento < max_intentos - 1:
+            time.sleep(1)  # Esperar 1 segundo antes de reintentar
+    
+    return False
+
+
+def get_updates(offset=0):
+    """Obtiene actualizaciones de Telegram con timeout largo"""
+    try:
+        r = requests.get(
+            f"{API}/getUpdates",
+            params={
+                "offset": offset,
+                "timeout": 30,
+            },
+            timeout=35
+        )
         return r.json().get("result", [])
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Error obteniendo updates: {e}")
         return []
 
 
 def handle(msg):
-    chat_id  = str(msg["chat"]["id"])
-    text     = msg.get("text", "").strip()
+    """Procesa los mensajes recibidos"""
+    chat_id = str(msg["chat"]["id"])
+    text = msg.get("text", "").strip()
     username = msg.get("from", {}).get("username", "")
-    nombre   = msg.get("from", {}).get("first_name", "Usuario")
+    nombre = msg.get("from", {}).get("first_name", "Usuario")
     es_admin = (chat_id == str(ADMIN_CHAT_ID))
 
     # ── /start ────────────────────────────────────────────────
@@ -79,7 +153,17 @@ def handle(msg):
              f"  /mislives — Ver tus lives\n"
              + (f"  /usuarios — Ver todos los usuarios\n"
                 f"  /adduser — Agregar usuario manualmente\n"
+                f"  /ping — Verificar estado del bot\n"
                 if es_admin else ""))
+        return
+
+    # ── /ping (solo admin) ────────────────────────────────────
+    if text == "/ping" and es_admin:
+        send(chat_id,
+             f"✅ <b>BOT ACTIVO</b>\n"
+             f"━━━━━━━━━━━━━━━━━━\n"
+             f"🤖 Operando correctamente\n"
+             f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S')}")
         return
 
     # ── /registro ─────────────────────────────────────────────
@@ -111,6 +195,7 @@ def handle(msg):
         if not usuarios:
             send(chat_id, "📭 No hay usuarios registrados.")
             return
+        
         lines = ["👥 <b>USUARIOS ACTIVOS</b>\n━━━━━━━━━━━━━━━━━━"]
         for u in usuarios:
             lines.append(
@@ -123,7 +208,6 @@ def handle(msg):
         return
 
     # ── /adduser (admin agrega usuario directamente) ──────────
-    # Uso: /adduser username password chat_id
     if text.startswith("/adduser") and es_admin:
         partes = text.split()
         if len(partes) < 4:
@@ -131,26 +215,32 @@ def handle(msg):
                  "⚠️ Uso correcto:\n"
                  "<code>/adduser username contraseña chat_id</code>")
             return
+        
         _, uname, pwd, cid = partes[0], partes[1], partes[2], partes[3]
         resultado = registrar_usuario(uname, pwd, cid)
+        
         if resultado["ok"]:
+            # Notificar al admin
             send(chat_id,
                  f"✅ Usuario <b>{uname}</b> creado correctamente.\n"
                  f"🔑 Contraseña: <code>{pwd}</code>\n"
                  f"🆔 Chat ID: <code>{cid}</code>")
+            
+            # Notificar al nuevo usuario
             send(cid,
                  f"✅ <b>Acceso aprobado</b>\n"
                  f"━━━━━━━━━━━━━━━━━━\n"
                  f"👤 Usuario: <code>{uname}</code>\n"
                  f"🔑 Contraseña: <code>{pwd}</code>\n\n"
-                 f"Ya puedes iniciar sesión en ANUBIS CHK.")
+                 f"Ya puedes iniciar sesión en ANUBIS CHK.\n"
+                 f"🤖 @anubischekbot")
         else:
             send(chat_id, f"❌ Error: {resultado['error']}")
         return
 
     # ── Flujo de registro paso a paso ─────────────────────────
     estado = _estados.get(chat_id, {})
-    step   = estado.get("step", "")
+    step = estado.get("step", "")
 
     if step == "esperando_usuario":
         if len(text) < 3 or " " in text:
@@ -176,13 +266,13 @@ def handle(msg):
 
     if step == "confirmando":
         if text.upper() == "SI":
-            data  = estado["data"]
+            data = estado["data"]
             uname = data["username"]
-            pwd   = data["password"]
+            pwd = data["password"]
 
             # Verificar si ya existe
             from firebase_manager import get_db
-            db  = get_db()
+            db = get_db()
             ref = db.collection("usuarios").document(uname.lower())
             doc = ref.get()
 
@@ -193,11 +283,11 @@ def handle(msg):
 
             # Guardar solicitud pendiente
             _pendientes[chat_id] = {
-                "username":      uname,
-                "password":      pwd,
-                "chat_id":       chat_id,
+                "username": uname,
+                "password": pwd,
+                "chat_id": chat_id,
                 "telegram_user": username,
-                "nombre":        nombre,
+                "nombre": nombre,
             }
             del _estados[chat_id]
 
@@ -205,17 +295,23 @@ def handle(msg):
                  "⏳ <b>Solicitud enviada al admin.</b>\n"
                  "Recibirás tu acceso cuando sea aprobada.")
 
-            # Notificar al admin
-            send(ADMIN_CHAT_ID,
-                 f"🔔 <b>NUEVA SOLICITUD DE ACCESO</b>\n"
-                 f"━━━━━━━━━━━━━━━━━━\n"
-                 f"👤 Nombre: {nombre}\n"
-                 f"📱 Telegram: @{username}\n"
-                 f"🆔 Chat ID: <code>{chat_id}</code>\n"
-                 f"🔑 Usuario: <b>{uname}</b>\n"
-                 f"🔒 Pass: <code>{pwd}</code>\n\n"
-                 f"Para aprobar:\n"
-                 f"<code>/adduser {uname} {pwd} {chat_id}</code>")
+            # Notificar al admin con GARANTÍA de entrega
+            mensaje_admin = (
+                f"🔔 <b>NUEVA SOLICITUD DE ACCESO</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"👤 Nombre: {nombre}\n"
+                f"📱 Telegram: @{username}\n"
+                f"🆔 Chat ID: <code>{chat_id}</code>\n"
+                f"🔑 Usuario: <b>{uname}</b>\n"
+                f"🔒 Pass: <code>{pwd}</code>\n\n"
+                f"Para aprobar:\n"
+                f"<code>/adduser {uname} {pwd} {chat_id}</code>"
+            )
+            
+            # Enviar con retry
+            enviado = send(ADMIN_CHAT_ID, mensaje_admin)
+            if not enviado:
+                print(f"❌ CRÍTICO: No se pudo notificar al admin sobre solicitud de {uname}")
 
         elif text.upper() == "NO":
             del _estados[chat_id]
@@ -226,20 +322,77 @@ def handle(msg):
 
 
 def main():
-    print("🤖 Bot ANUBIS CHK iniciado...")
-    print(f"👑 Admin ID: {ADMIN_CHAT_ID}")
+    """Función principal del bot"""
+    print("=" * 60)
+    print("🤖 ANUBIS CHK Bot iniciando...")
+    print("=" * 60)
+    print(f"👑 Admin Chat ID: {ADMIN_CHAT_ID}")
+    print(f"🔑 Token: {TELEGRAM_TOKEN[:20]}...")
+    print("=" * 60)
+    
+    # Iniciar servidor HTTP en thread separado (daemon)
+    http_thread = Thread(target=run_http_server, daemon=True)
+    http_thread.start()
+    print("✅ Thread HTTP iniciado")
+    
+    # Pequeña pausa para que el servidor HTTP se inicie
+    time.sleep(2)
+    
+    # Notificar al admin que el bot está online
+    send(ADMIN_CHAT_ID,
+         f"✅ <b>BOT INICIADO</b>\n"
+         f"━━━━━━━━━━━━━━━━━━\n"
+         f"🤖 ANUBIS CHK está online\n"
+         f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    print("✅ Bot listo - esperando mensajes...")
+    print("=" * 60)
+    
+    # Loop principal del bot
     offset = 0
+    errores_consecutivos = 0
+    max_errores = 5
+    
     while True:
-        updates = get_updates(offset)
-        for upd in updates:
-            offset = upd["update_id"] + 1
-            msg    = upd.get("message")
-            if msg and "text" in msg:
-                try:
-                    handle(msg)
-                except Exception as e:
-                    print(f"Error procesando mensaje: {e}")
-        time.sleep(1)
+        try:
+            updates = get_updates(offset)
+            
+            # Reset del contador de errores si todo va bien
+            if updates:
+                errores_consecutivos = 0
+            
+            for upd in updates:
+                offset = upd["update_id"] + 1
+                msg = upd.get("message")
+                
+                if msg and "text" in msg:
+                    try:
+                        handle(msg)
+                    except Exception as e:
+                        print(f"❌ Error procesando mensaje: {e}")
+                        import traceback
+                        traceback.print_exc()
+            
+            time.sleep(1)
+            
+        except KeyboardInterrupt:
+            print("\n⚠️ Bot detenido por usuario")
+            send(ADMIN_CHAT_ID, "⚠️ Bot detenido manualmente")
+            break
+            
+        except Exception as e:
+            errores_consecutivos += 1
+            print(f"❌ Error en loop principal ({errores_consecutivos}/{max_errores}): {e}")
+            
+            if errores_consecutivos >= max_errores:
+                print("❌ Demasiados errores consecutivos. Deteniendo bot.")
+                send(ADMIN_CHAT_ID,
+                     f"❌ <b>BOT DETENIDO</b>\n"
+                     f"Demasiados errores consecutivos.\n"
+                     f"Último error: {str(e)[:100]}")
+                break
+            
+            time.sleep(5)  # Esperar más tiempo después de un error
 
 
 if __name__ == "__main__":
