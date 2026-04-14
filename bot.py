@@ -40,10 +40,10 @@ class Config:
     HTTP_TIMEOUT = 30
     
     # Telegram
-    POLLING_TIMEOUT = 30
-    REQUEST_TIMEOUT = 15
-    MAX_RETRIES = 5
-    RETRY_DELAY = 3
+    POLLING_TIMEOUT = 60  # Aumentar de 30 a 60
+    REQUEST_TIMEOUT = 30  # Aumentar de 15 a 30
+    MAX_RETRIES = 3  # Reducir de 5 a 3 para reiniciar más rápido
+    RETRY_DELAY = 5  # Aumentar de 3 a 5
     
     # Rate limiting
     MAX_REQUESTS_PER_SECOND = 30
@@ -51,8 +51,8 @@ class Config:
     
     # Health monitoring
     HEALTH_CHECK_INTERVAL = 60
-    MAX_ERRORS_BEFORE_RESTART = 10
-    ERROR_WINDOW = 300  # 5 minutos
+    MAX_ERRORS_BEFORE_RESTART = 15  # Aumentar de 10 a 15
+    ERROR_WINDOW = 600  # Aumentar de 300 a 600 (10 minutos)
     
     # Graceful shutdown
     SHUTDOWN_GRACE_PERIOD = 5
@@ -86,18 +86,18 @@ class HealthMonitor:
             return [e for e in self.errors if now - e["timestamp"] < window]
     
     def is_healthy(self):
-        """Verificar si el bot está saludable"""
-        recent_errors = self.get_recent_errors(Config.ERROR_WINDOW)
+    """Verificar si el bot está saludable"""
+    recent_errors = self.get_recent_errors(Config.ERROR_WINDOW)
+    
+    # Demasiados errores recientes
+    if len(recent_errors) > Config.MAX_ERRORS_BEFORE_RESTART:
+        return False
         
-        # Demasiados errores recientes
-        if len(recent_errors) > Config.MAX_ERRORS_BEFORE_RESTART:
-            return False
-            
-        # Sin respuesta de Telegram por mucho tiempo
-        if time.time() - self.last_telegram_response > 120:
-            return False
-            
-        return True
+    # Sin respuesta de Telegram por mucho tiempo - AUMENTAR EL LÍMITE
+    if time.time() - self.last_telegram_response > 300:  # Cambiar de 120 a 300 segundos
+        return False
+        
+    return True
     
     def update_activity(self):
         self.last_update = time.time()
@@ -337,9 +337,10 @@ def send(chat_id, text, parse_mode="HTML"):
 
 def get_updates(offset=0):
     """Obtener updates con manejo robusto"""
+    # Aumentar el timeout específicamente para getUpdates
     result = telegram_request("getUpdates", params={
         "offset": offset,
-        "timeout": Config.POLLING_TIMEOUT
+        "timeout": Config.POLLING_TIMEOUT * 2  # Duplicar el timeout
     })
     
     if result.get("ok"):
@@ -695,6 +696,8 @@ def main_loop():
 
     offset = 0
     consecutive_errors = 0
+    last_successful_update = time.time()
+    health_check_counter = 0
     
     print("✅ Bot iniciado. Esperando mensajes...")
 
@@ -704,6 +707,7 @@ def main_loop():
             
             if updates:
                 consecutive_errors = 0  # Reset en operación exitosa
+                last_successful_update = time.time()
                 
                 for update in updates:
                     offset = update["update_id"] + 1
@@ -714,11 +718,22 @@ def main_loop():
                         except Exception as e:
                             print(f"❌ Error procesando mensaje: {e}")
                             health.record_error("message_handler", e)
+            else:
+                # Si no hay actualizaciones, verificar cuánto tiempo ha pasado
+                # desde la última actualización exitosa
+                if time.time() - last_successful_update > 300:  # 5 minutos
+                    print("⚠️ Sin actualizaciones por 5 minutos. Verificando conectividad...")
+                    # Podrías añadir aquí una prueba de conectividad
             
-            # Verificar salud del sistema
-            if not health.is_healthy():
-                print("⚠️ Sistema no saludable. Iniciando reinicio...")
-                break
+            # Verificar salud del sistema con menos frecuencia
+            health_check_counter += 1
+            if health_check_counter >= 120:  # Cada 60 segundos (0.5s * 120)
+                health_check_counter = 0
+                if not health.is_healthy():
+                    print("⚠️ Sistema no saludable. Esperando antes de reiniciar...")
+                    # Esperar más tiempo antes de reiniciar
+                    time.sleep(30)
+                    break
                 
             time.sleep(0.5)
             
@@ -736,7 +751,8 @@ def main_loop():
                 print("💀 Demasiados errores consecutivos. Reiniciando...")
                 break
             
-            time.sleep(Config.RETRY_DELAY)
+            # Aumentar el tiempo de espera entre reintentos
+            time.sleep(Config.RETRY_DELAY * (consecutive_errors + 1))
     
     # Shutdown graceful
     print("🛑 Iniciando shutdown graceful...")
