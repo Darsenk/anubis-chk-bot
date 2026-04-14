@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: anubis-chk-bot
+    restart: unless-stopped
+    
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - ADMIN_CHAT_ID=${ADMIN_CHAT_ID}
+      - FIREBASE_CREDENTIALS=${FIREBASE_CREDENTIALS}
+      - PORT=8000
+    
+    ports:
+      - "8000:8000"
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    
+    # Límites de recursos
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    
+    # Logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Política de reinicio
+    restart: unless-stopped
