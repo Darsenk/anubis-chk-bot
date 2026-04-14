@@ -1,11 +1,12 @@
 """
 ═══════════════════════════════════════════════════════════════
-BOT TELEGRAM — ANUBIS CHK (con Health Check HTTP)
+BOT TELEGRAM — ANUBIS CHK (24/7 ACTIVO)
 ═══════════════════════════════════════════════════════════════
-Versión mejorada con:
-- Servidor HTTP para health checks (Koyeb/UptimeRobot)
-- Notificaciones garantizadas al admin
-- Mejor manejo de errores
+Versión optimizada para Koyeb:
+- Puerto correcto (8000)
+- Health check HTTP mejorado
+- Sin sleep mode
+- Notificaciones garantizadas
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -29,8 +30,6 @@ from firebase_manager import (
     ADMIN_CHAT_ID,
 )
 
-# ⚠️ IMPORTANTE: El token viene de firebase_manager.py (que lo importa de config.py)
-# NO lo pongas hardcodeado aquí
 API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 _estados = {}
@@ -41,7 +40,7 @@ _pendientes = {}
 # SERVIDOR HTTP PARA HEALTH CHECKS
 # ══════════════════════════════════════════════════════════════
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Handler HTTP minimalista para health checks"""
+    """Handler HTTP para health checks de Koyeb"""
     
     def do_GET(self):
         """Responde a GET requests de health check"""
@@ -53,29 +52,28 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             "status": "healthy",
             "service": "ANUBIS CHK Bot",
             "bot": "online",
-            "timestamp": int(time.time())
+            "timestamp": int(time.time()),
+            "uptime": int(time.time() - start_time)
         }
         
         self.wfile.write(json.dumps(response).encode())
     
     def do_HEAD(self):
-        """Responde a HEAD requests (algunos servicios lo usan)"""
+        """Responde a HEAD requests"""
         self.send_response(200)
         self.end_headers()
     
     def log_message(self, format, *args):
-        """Silenciar logs HTTP para no saturar los logs del bot"""
+        """Silenciar logs HTTP"""
         pass
 
 
 def run_http_server():
     """
-    Inicia el servidor HTTP en el puerto configurado.
-    Koyeb/Railway/Render necesitan que la app escuche en un puerto HTTP.
+    Inicia el servidor HTTP en el puerto 8000 (requerido por Koyeb).
     """
-    # Usar el puerto de la variable de entorno PORT (Koyeb lo asigna automáticamente)
-    # Si no existe, usar 8080 por defecto
-    port = int(os.environ.get('PORT', 8080))
+    # IMPORTANTE: Usar puerto 8000 para Koyeb
+    port = int(os.environ.get('PORT', 8000))
     
     try:
         server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
@@ -84,8 +82,14 @@ def run_http_server():
         server.serve_forever()
     except Exception as e:
         print(f"❌ Error al iniciar servidor HTTP: {e}")
-        # No detener el bot si falla el servidor HTTP
-        pass
+        # Intentar con puerto alternativo
+        try:
+            port = 8080
+            server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+            print(f"✅ HTTP Server iniciado en puerto alternativo {port}")
+            server.serve_forever()
+        except:
+            print(f"❌ No se pudo iniciar servidor HTTP en ningún puerto")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -115,7 +119,7 @@ def send(chat_id, text, parse_mode="HTML"):
             print(f"❌ Excepción enviando mensaje (intento {intento + 1}/{max_intentos}): {e}")
         
         if intento < max_intentos - 1:
-            time.sleep(1)  # Esperar 1 segundo antes de reintentar
+            time.sleep(1)
     
     return False
 
@@ -157,16 +161,33 @@ def handle(msg):
              + (f"  /usuarios — Ver todos los usuarios\n"
                 f"  /adduser — Agregar usuario manualmente\n"
                 f"  /ping — Verificar estado del bot\n"
+                f"  /status — Estado del servidor\n"
                 if es_admin else ""))
         return
 
     # ── /ping (solo admin) ────────────────────────────────────
     if text == "/ping" and es_admin:
+        uptime = int(time.time() - start_time)
         send(chat_id,
              f"✅ <b>BOT ACTIVO</b>\n"
              f"━━━━━━━━━━━━━━━━━━\n"
              f"🤖 Operando correctamente\n"
-             f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S')}")
+             f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+             f"🔄 Uptime: {uptime//3600}h {(uptime%3600)//60}m")
+        return
+
+    # ── /status (solo admin) ──────────────────────────────────
+    if text == "/status" and es_admin:
+        usuarios = obtener_todos_usuarios()
+        uptime = int(time.time() - start_time)
+        send(chat_id,
+             f"📊 <b>ESTADO DEL SISTEMA</b>\n"
+             f"━━━━━━━━━━━━━━━━━━\n"
+             f"🤖 Bot: ONLINE\n"
+             f"🌐 HTTP Server: ACTIVE\n"
+             f"👥 Usuarios: {len(usuarios)}\n"
+             f"⏰ Uptime: {uptime//3600}h {(uptime%3600)//60}m\n"
+             f"📅 {time.strftime('%Y-%m-%d %H:%M:%S')}")
         return
 
     # ── /registro ─────────────────────────────────────────────
@@ -223,13 +244,11 @@ def handle(msg):
         resultado = registrar_usuario(uname, pwd, cid)
         
         if resultado["ok"]:
-            # Notificar al admin
             send(chat_id,
                  f"✅ Usuario <b>{uname}</b> creado correctamente.\n"
                  f"🔑 Contraseña: <code>{pwd}</code>\n"
                  f"🆔 Chat ID: <code>{cid}</code>")
             
-            # Notificar al nuevo usuario
             send(cid,
                  f"✅ <b>Acceso aprobado</b>\n"
                  f"━━━━━━━━━━━━━━━━━━\n"
@@ -273,18 +292,15 @@ def handle(msg):
             uname = data["username"]
             pwd = data["password"]
 
-            # Verificar si ya existe en la colección "users"
             db = get_db()
-            users_ref = db.collection("users")
-            query = users_ref.where('username', '==', uname).limit(1)
-            docs = list(query.stream())
+            ref = db.collection("usuarios").document(uname.lower())
+            doc = ref.get()
 
-            if docs:
+            if doc.exists:
                 send(chat_id, "❌ Ese usuario ya existe. Usa otro nombre.")
                 del _estados[chat_id]
                 return
 
-            # Guardar solicitud pendiente
             _pendientes[chat_id] = {
                 "username": uname,
                 "password": pwd,
@@ -298,7 +314,6 @@ def handle(msg):
                  "⏳ <b>Solicitud enviada al admin.</b>\n"
                  "Recibirás tu acceso cuando sea aprobada.")
 
-            # Notificar al admin con GARANTÍA de entrega
             mensaje_admin = (
                 f"🔔 <b>NUEVA SOLICITUD DE ACCESO</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -311,7 +326,6 @@ def handle(msg):
                 f"<code>/adduser {uname} {pwd} {chat_id}</code>"
             )
             
-            # Enviar con retry
             enviado = send(ADMIN_CHAT_ID, mensaje_admin)
             if not enviado:
                 print(f"❌ CRÍTICO: No se pudo notificar al admin sobre solicitud de {uname}")
@@ -324,24 +338,31 @@ def handle(msg):
         return
 
 
+# Variable global para tracking de uptime
+start_time = time.time()
+
+
 def main():
     """Función principal del bot"""
+    global start_time
+    start_time = time.time()
+    
     print("=" * 60)
     print("🤖 ANUBIS CHK Bot iniciando...")
     print("=" * 60)
     print(f"👑 Admin Chat ID: {ADMIN_CHAT_ID}")
     print(f"🔑 Token: {TELEGRAM_TOKEN[:20]}...")
+    print(f"🌐 Puerto HTTP: {os.environ.get('PORT', 8000)}")
     print("=" * 60)
     
-    # Iniciar servidor HTTP en thread separado (daemon)
+    # Iniciar servidor HTTP en thread separado
     http_thread = Thread(target=run_http_server, daemon=True)
     http_thread.start()
     print("✅ Thread HTTP iniciado")
     
-    # Pequeña pausa para que el servidor HTTP se inicie
     time.sleep(2)
     
-    # Notificar al admin que el bot está online
+    # Notificar al admin
     send(ADMIN_CHAT_ID,
          f"✅ <b>BOT INICIADO</b>\n"
          f"━━━━━━━━━━━━━━━━━━\n"
@@ -351,16 +372,14 @@ def main():
     print("✅ Bot listo - esperando mensajes...")
     print("=" * 60)
     
-    # Loop principal del bot
     offset = 0
     errores_consecutivos = 0
-    max_errores = 5
+    max_errores = 10
     
     while True:
         try:
             updates = get_updates(offset)
             
-            # Reset del contador de errores si todo va bien
             if updates:
                 errores_consecutivos = 0
             
@@ -395,7 +414,7 @@ def main():
                      f"Último error: {str(e)[:100]}")
                 break
             
-            time.sleep(5)  # Esperar más tiempo después de un error
+            time.sleep(5)
 
 
 if __name__ == "__main__":
