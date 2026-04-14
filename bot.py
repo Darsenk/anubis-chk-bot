@@ -3,7 +3,7 @@
 ANUBIS CHK BOT — ANTI-CAÍDAS PRO MAX
 ═══════════════════════════════════════════════════════════════
 """
-
+import socket
 import os
 import sys
 import time
@@ -205,16 +205,23 @@ def run_http_server():
     """Servidor HTTP con reintentos automáticos"""
     while True:
         try:
+            # Añadir esta opción para reutilizar la dirección
+            HTTPServer.address_family = socket.AF_INET
             server = HTTPServer(("0.0.0.0", Config.HTTP_PORT), ImprovedHealthCheckHandler)
+            server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.timeout = Config.HTTP_TIMEOUT
             print(f"🌐 HTTP Server running on port {Config.HTTP_PORT}")
             server.serve_forever()
         except Exception as e:
             print(f"❌ HTTP Server error: {e}")
             health.record_error("http_server", e)
+            # Asegurarse de cerrar el servidor antes de continuar
+            try:
+                server.server_close()
+            except:
+                pass
             time.sleep(5)
-
-
+            
 # ══════════════════════════════════════════════════════════════
 # TELEGRAM API CON RETRY Y RATE LIMITING
 # ══════════════════════════════════════════════════════════════
