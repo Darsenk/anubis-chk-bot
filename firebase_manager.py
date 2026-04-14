@@ -1,11 +1,13 @@
 """
 ═══════════════════════════════════════════════════════════════
-FIREBASE MANAGER — ANUBIS CHK (COMPLETO)
+FIREBASE MANAGER — ANUBIS CHK (PRO MAX)
 ═══════════════════════════════════════════════════════════════
 """
 
 import os
 import json
+import time
+import hashlib
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -16,59 +18,84 @@ from firebase_admin import credentials, firestore
 def _cargar_config():
     token = os.environ.get("TELEGRAM_TOKEN")
     admin_id = os.environ.get("ADMIN_CHAT_ID")
-    firebase_creds_json = os.environ.get("FIREBASE_CREDENTIALS")
+    firebase_creds = os.environ.get("FIREBASE_CREDENTIALS")
 
-    if token and admin_id and firebase_creds_json:
-        try:
-            creds_dict = json.loads(firebase_creds_json)
-        except json.JSONDecodeError:
-            raise RuntimeError("FIREBASE_CREDENTIALS no es JSON válido")
-        return token, str(admin_id), creds_dict
+    if token and admin_id and firebase_creds:
+        return token, str(admin_id), json.loads(firebase_creds)
 
-    # fallback local
     try:
         import config
-        token = token or getattr(config, "TELEGRAM_TOKEN", None)
-        admin_id = admin_id or str(getattr(config, "ADMIN_CHAT_ID", ""))
-        creds_dict = getattr(config, "FIREBASE_CREDENTIALS", None)
-
-        if not token or not admin_id or not creds_dict:
-            raise RuntimeError("Faltan datos en config.py")
-
-        return token, str(admin_id), creds_dict
-
-    except ImportError:
-        raise RuntimeError("No hay config.py ni variables de entorno")
+        return (
+            getattr(config, "TELEGRAM_TOKEN"),
+            str(getattr(config, "ADMIN_CHAT_ID")),
+            getattr(config, "FIREBASE_CREDENTIALS")
+        )
+    except:
+        raise RuntimeError("❌ Configuración faltante")
 
 
-TELEGRAM_TOKEN, ADMIN_CHAT_ID, _FIREBASE_CREDENTIALS = _cargar_config()
-
+TELEGRAM_TOKEN, ADMIN_CHAT_ID, FIREBASE_CREDS = _cargar_config()
 
 # ══════════════════════════════════════════════════════════════
-# FIREBASE INIT (ANTI-DUPLICATE)
+# FIREBASE INIT
 # ══════════════════════════════════════════════════════════════
 
 _db = None
 
 def get_db():
     global _db
-
     if _db:
         return _db
 
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(FIREBASE_CREDS)
+        firebase_admin.initialize_app(cred)
+
+    _db = firestore.client()
+    print("✅ Firebase listo")
+    return _db
+
+# ══════════════════════════════════════════════════════════════
+# CACHE + RATE LIMIT
+# ══════════════════════════════════════════════════════════════
+
+_cache = {}
+_rate_limit = {}
+
+def rate_limit(chat_id, limite=5, ventana=10):
+    ahora = time.time()
+
+    if chat_id not in _rate_limit:
+        _rate_limit[chat_id] = []
+
+    _rate_limit[chat_id] = [
+        t for t in _rate_limit[chat_id]
+        if ahora - t < ventana
+    ]
+
+    if len(_rate_limit[chat_id]) >= limite:
+        return False
+
+    _rate_limit[chat_id].append(ahora)
+    return True
+
+# ══════════════════════════════════════════════════════════════
+# UTILIDADES
+# ══════════════════════════════════════════════════════════════
+
+def _hash(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def log_evento(tipo, data):
     try:
-        if not firebase_admin._apps:
-            cred = credentials.Certificate(_FIREBASE_CREDENTIALS)
-            firebase_admin.initialize_app(cred)
-            print("✅ Firebase conectado")
-
-        _db = firestore.client()
-        return _db
-
-    except Exception as e:
-        print(f"❌ Error Firebase init: {e}")
-        raise
-
+        db = get_db()
+        db.collection("logs").add({
+            "tipo": tipo,
+            "data": data,
+            "timestamp": firestore.SERVER_TIMESTAMP
+        })
+    except:
+        pass
 
 # ══════════════════════════════════════════════════════════════
 # USUARIOS
@@ -82,48 +109,91 @@ def registrar_usuario(username, password, chat_id):
         ref = db.collection("usuarios").document(doc_id)
 
         if ref.get().exists:
-            return {"ok": False, "error": "Usuario ya existe"}
+            return {"ok": False, "error": "Ya existe"}
 
         ref.set({
             "username": username,
-            "password": password,
+            "password": _hash(password),
             "chat_id": str(chat_id),
             "lives_count": 0,
-            "telegram_user": "",
             "activo": True,
-            "created_at": firestore.SERVER_TIMESTAMP
+            "bloqueado": False,
+            "intentos_fallidos": 0,
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "last_login": None
         })
+
+        log_evento("registro", username)
 
         return {"ok": True}
 
     except Exception as e:
-        print(f"❌ registrar_usuario: {e}")
         return {"ok": False, "error": str(e)}
 
+# ══════════════════════════════════════════════════════════════
+# LOGIN
+# ══════════════════════════════════════════════════════════════
 
 def verificar_login(username, password):
     try:
         db = get_db()
         doc_id = username.lower().strip()
 
-        doc = db.collection("usuarios").document(doc_id).get()
+        ref = db.collection("usuarios").document(doc_id)
+        doc = ref.get()
 
         if not doc.exists:
             return {"ok": False, "error": "No existe"}
 
         data = doc.to_dict()
 
-        if data["password"] != password:
+        if data.get("bloqueado"):
+            return {"ok": False, "error": "Usuario bloqueado"}
+
+        if data["password"] != _hash(password):
+            intentos = data.get("intentos_fallidos", 0) + 1
+
+            ref.update({"intentos_fallidos": intentos})
+
+            if intentos >= 5:
+                ref.update({"bloqueado": True})
+
             return {"ok": False, "error": "Contraseña incorrecta"}
 
-        if not data.get("activo", True):
-            return {"ok": False, "error": "Usuario desactivado"}
+        # login correcto
+        ref.update({
+            "intentos_fallidos": 0,
+            "last_login": firestore.SERVER_TIMESTAMP
+        })
+
+        log_evento("login", username)
 
         return {"ok": True, "data": data}
 
     except Exception as e:
-        print(f"❌ verificar_login: {e}")
         return {"ok": False, "error": str(e)}
+
+# ══════════════════════════════════════════════════════════════
+# CONSULTAS
+# ══════════════════════════════════════════════════════════════
+
+def obtener_usuario(username):
+    if username in _cache:
+        return _cache[username]
+
+    try:
+        db = get_db()
+        doc = db.collection("usuarios").document(username.lower()).get()
+
+        if not doc.exists:
+            return None
+
+        data = doc.to_dict()
+        _cache[username] = data
+        return data
+
+    except:
+        return None
 
 
 def obtener_todos_usuarios():
@@ -138,38 +208,46 @@ def obtener_todos_usuarios():
 
         return usuarios
 
-    except Exception as e:
-        print(f"❌ obtener usuarios: {e}")
+    except:
         return []
 
-
 # ══════════════════════════════════════════════════════════════
-# EXTRA (IMPORTANTE PARA TU BOT)
+# STATS
 # ══════════════════════════════════════════════════════════════
 
 def actualizar_lives(username, cantidad=1):
     try:
         db = get_db()
-        doc_id = username.lower().strip()
-
-        ref = db.collection("usuarios").document(doc_id)
-
-        ref.update({
+        db.collection("usuarios").document(username.lower()).update({
             "lives_count": firestore.Increment(cantidad)
         })
 
+        log_evento("lives_update", username)
         return True
-
-    except Exception as e:
-        print(f"❌ actualizar_lives: {e}")
+    except:
         return False
 
+# ══════════════════════════════════════════════════════════════
+# ADMIN
+# ══════════════════════════════════════════════════════════════
 
-def desactivar_usuario(username):
+def bloquear_usuario(username):
     try:
         db = get_db()
         db.collection("usuarios").document(username.lower()).update({
-            "activo": False
+            "bloqueado": True
+        })
+        return True
+    except:
+        return False
+
+
+def desbloquear_usuario(username):
+    try:
+        db = get_db()
+        db.collection("usuarios").document(username.lower()).update({
+            "bloqueado": False,
+            "intentos_fallidos": 0
         })
         return True
     except:
@@ -187,6 +265,17 @@ def activar_usuario(username):
         return False
 
 
+def desactivar_usuario(username):
+    try:
+        db = get_db()
+        db.collection("usuarios").document(username.lower()).update({
+            "activo": False
+        })
+        return True
+    except:
+        return False
+
+
 def eliminar_usuario(username):
     try:
         db = get_db()
@@ -194,3 +283,26 @@ def eliminar_usuario(username):
         return True
     except:
         return False
+
+# ══════════════════════════════════════════════════════════════
+# STATS GLOBALES
+# ══════════════════════════════════════════════════════════════
+
+def stats_globales():
+    try:
+        usuarios = obtener_todos_usuarios()
+
+        total = len(usuarios)
+        activos = sum(1 for u in usuarios if u.get("activo"))
+        bloqueados = sum(1 for u in usuarios if u.get("bloqueado"))
+        lives = sum(u.get("lives_count", 0) for u in usuarios)
+
+        return {
+            "total": total,
+            "activos": activos,
+            "bloqueados": bloqueados,
+            "lives": lives
+        }
+
+    except:
+        return {}
