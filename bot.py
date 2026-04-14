@@ -86,18 +86,18 @@ class HealthMonitor:
             return [e for e in self.errors if now - e["timestamp"] < window]
     
     def is_healthy(self):
-    """Verificar si el bot está saludable"""
-    recent_errors = self.get_recent_errors(Config.ERROR_WINDOW)
-    
-    # Demasiados errores recientes
-    if len(recent_errors) > Config.MAX_ERRORS_BEFORE_RESTART:
-        return False
+        """Verificar si el bot está saludable"""
+        recent_errors = self.get_recent_errors(Config.ERROR_WINDOW)
         
-    # Sin respuesta de Telegram por mucho tiempo - AUMENTAR EL LÍMITE
-    if time.time() - self.last_telegram_response > 300:  # Cambiar de 120 a 300 segundos
-        return False
-        
-    return True
+        # Demasiados errores recientes
+        if len(recent_errors) > Config.MAX_ERRORS_BEFORE_RESTART:
+            return False
+            
+        # Sin respuesta de Telegram por mucho tiempo - AUMENTAR EL LÍMITE
+        if time.time() - self.last_telegram_response > 300:  # Cambiar de 120 a 300 segundos
+            return False
+            
+        return True
     
     def update_activity(self):
         self.last_update = time.time()
@@ -221,7 +221,6 @@ def run_http_server():
             except:
                 pass
             time.sleep(5)
-            
 # ══════════════════════════════════════════════════════════════
 # TELEGRAM API CON RETRY Y RATE LIMITING
 # ══════════════════════════════════════════════════════════════
@@ -410,6 +409,37 @@ def handle(msg):
                  f"Última actividad: {stats['last_activity']}s")
             return
 
+        # ── DEBUG DB ──
+        if text == "/debugdb" and es_admin:
+            try:
+                db = get_db()
+                
+                # Obtener información sobre la colección usuarios
+                docs = list(db.collection("usuarios").stream())
+                
+                txt = f"🔍 <b>DEBUG BASE DE DATOS</b>\n\n"
+                txt += f"Colección: usuarios\n"
+                txt += f"Total documentos: {len(docs)}\n\n"
+                
+                # Mostrar los primeros 5 documentos
+                for i, doc in enumerate(docs[:5]):
+                    data = doc.to_dict()
+                    txt += f"Doc #{i+1} (ID: {doc.id}):\n"
+                    for key, value in data.items():
+                        txt += f"  {key}: {value}\n"
+                    txt += "\n"
+                
+                if len(docs) > 5:
+                    txt += f"... y {len(docs) - 5} más\n"
+                
+                send(chat_id, txt)
+                
+            except Exception as e:
+                print(f"❌ Error en debugdb: {e}")
+                import traceback
+                traceback.print_exc()
+                send(chat_id, f"❌ Error: {str(e)}")
+            return
         # ── USUARIOS ──
         if text == "/usuarios" and es_admin:
             users = obtener_todos_usuarios()
@@ -425,194 +455,219 @@ def handle(msg):
             return
 
         # ── BUSCAR ──
-        if text.startswith("/buscar") and es_admin:
-            try:
-                parts = text.split(maxsplit=1)
-                if len(parts) < 2:
-                    send(chat_id, "❌ Uso: /buscar username")
+                if text.startswith("/buscar") and es_admin:
+                    try:
+                        parts = text.split(maxsplit=1)
+                        if len(parts) < 2:
+                            send(chat_id, "❌ Uso: /buscar username")
+                            return
+                            
+                        user = parts[1].lower()  # Asegurar que sea minúsculas
+                        print(f"🔍 Buscando usuario: {user}")
+                        
+                        db = get_db()
+                        
+                        # Intentar obtener el documento
+                        doc_ref = db.collection("usuarios").document(user)
+                        doc = doc_ref.get()
+                        
+                        print(f"📄 Documento existe: {doc.exists}")
+                        print(f"📄 ID del documento: {doc.id}")
+                        
+                        if not doc.exists:
+                            # Intentar buscar por campo username en lugar de ID
+                            print(f"⚠️ Documento no encontrado por ID, buscando por campo...")
+                            query = db.collection("usuarios").where("username", "==", user).limit(1)
+                            query_docs = list(query.stream())
+                            
+                            if query_docs:
+                                doc = query_docs[0]
+                                print(f"✅ Usuario encontrado por campo username: {doc.id}")
+                            else:
+                                send(chat_id, f"❌ Usuario '{user}' no existe")
+                                return
+                        else:
+                            print(f"✅ Documento encontrado por ID: {doc.id}")
+
+                        u = doc.to_dict()
+                        print(f"📊 Datos del usuario: {u}")
+                        
+                        send(chat_id,
+                             f"👤 <b>INFORMACIÓN DE USUARIO</b>\n\n"
+                             f"Username: {u.get('username', 'N/A')}\n"
+                             f"Lives: {u.get('lives_count', 0)}\n"
+                             f"Chat ID: {u.get('chat_id', 'N/A')}\n"
+                             f"Activo: {'✅ Sí' if u.get('activo', True) else '🚫 No'}\n"
+                             f"Bloqueado: {'🔒 Sí' if u.get('bloqueado', False) else '✅ No'}")
+                             
+                    except Exception as e:
+                        print(f"❌ Error completo: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
+                        send(chat_id, f"❌ Error: {str(e)}")
+                        health.record_error("buscar_command", e)
                     return
-                    
-                user = parts[1]
-                db = get_db()
-                doc = db.collection("usuarios").document(user.lower()).get()
 
-                if not doc.exists:
-                    send(chat_id, f"❌ Usuario '{user}' no existe")
+                # ── DELETE ──
+                if text.startswith("/deluser") and es_admin:
+                    try:
+                        parts = text.split(maxsplit=1)
+                        if len(parts) < 2:
+                            send(chat_id, "❌ Uso: /deluser username")
+                            return
+                            
+                        user = parts[1]
+                        db = get_db()
+                        db.collection("usuarios").document(user.lower()).delete()
+                        send(chat_id, f"🗑️ Usuario '{user}' eliminado exitosamente")
+                    except Exception as e:
+                        send(chat_id, f"❌ Error: {str(e)}")
+                        health.record_error("deluser_command", e)
                     return
 
-                u = doc.to_dict()
-                send(chat_id,
-                     f"👤 <b>INFORMACIÓN DE USUARIO</b>\n\n"
-                     f"Username: {u['username']}\n"
-                     f"Lives: {u.get('lives_count', 0)}\n"
-                     f"Chat ID: {u.get('chat_id')}\n"
-                     f"Activo: {'✅ Sí' if u.get('activo', True) else '🚫 No'}\n"
-                     f"Bloqueado: {'🔒 Sí' if u.get('bloqueado', False) else '✅ No'}")
-            except Exception as e:
-                send(chat_id, f"❌ Error: {str(e)}")
-                health.record_error("buscar_command", e)
-            return
+                # ── TOP ──
+                if text == "/top" and es_admin:
+                    try:
+                        users = obtener_todos_usuarios()
+                        users = sorted(users, key=lambda x: x.get("lives_count", 0), reverse=True)
 
-        # ── DELETE ──
-        if text.startswith("/deluser") and es_admin:
-            try:
-                parts = text.split(maxsplit=1)
-                if len(parts) < 2:
-                    send(chat_id, "❌ Uso: /deluser username")
+                        txt = "🏆 <b>TOP USUARIOS</b>\n\n"
+                        for i, u in enumerate(users[:10], 1):
+                            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                            txt += f"{medal} {u['username']} → {u.get('lives_count', 0)} lives\n"
+
+                        send(chat_id, txt)
+                    except Exception as e:
+                        send(chat_id, f"❌ Error: {str(e)}")
+                        health.record_error("top_command", e)
                     return
-                    
-                user = parts[1]
-                db = get_db()
-                db.collection("usuarios").document(user.lower()).delete()
-                send(chat_id, f"🗑️ Usuario '{user}' eliminado exitosamente")
-            except Exception as e:
-                send(chat_id, f"❌ Error: {str(e)}")
-                health.record_error("deluser_command", e)
-            return
 
-        # ── TOP ──
-        if text == "/top" and es_admin:
-            try:
-                users = obtener_todos_usuarios()
-                users = sorted(users, key=lambda x: x.get("lives_count", 0), reverse=True)
-
-                txt = "🏆 <b>TOP USUARIOS</b>\n\n"
-                for i, u in enumerate(users[:10], 1):
-                    medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-                    txt += f"{medal} {u['username']} → {u.get('lives_count', 0)} lives\n"
-
-                send(chat_id, txt)
-            except Exception as e:
-                send(chat_id, f"❌ Error: {str(e)}")
-                health.record_error("top_command", e)
-            return
-
-        # ── RESET ──
-        if text.startswith("/reset") and es_admin:
-            try:
-                parts = text.split(maxsplit=1)
-                if len(parts) < 2:
-                    send(chat_id, "❌ Uso: /reset username")
+                # ── RESET ──
+                if text.startswith("/reset") and es_admin:
+                    try:
+                        parts = text.split(maxsplit=1)
+                        if len(parts) < 2:
+                            send(chat_id, "❌ Uso: /reset username")
+                            return
+                            
+                        user = parts[1]
+                        db = get_db()
+                        db.collection("usuarios").document(user.lower()).update({
+                            "lives_count": 0
+                        })
+                        send(chat_id, f"🔄 Lives de '{user}' reseteados a 0")
+                    except Exception as e:
+                        send(chat_id, f"❌ Error: {str(e)}")
+                        health.record_error("reset_command", e)
                     return
-                    
-                user = parts[1]
-                db = get_db()
-                db.collection("usuarios").document(user.lower()).update({
-                    "lives_count": 0
-                })
-                send(chat_id, f"🔄 Lives de '{user}' reseteados a 0")
-            except Exception as e:
-                send(chat_id, f"❌ Error: {str(e)}")
-                health.record_error("reset_command", e)
-            return
 
-        # ── BAN ──
-        if text.startswith("/ban") and es_admin:
-            try:
-                parts = text.split(maxsplit=1)
-                if len(parts) < 2:
-                    send(chat_id, "❌ Uso: /ban username")
+                # ── BAN ──
+                if text.startswith("/ban") and es_admin:
+                    try:
+                        parts = text.split(maxsplit=1)
+                        if len(parts) < 2:
+                            send(chat_id, "❌ Uso: /ban username")
+                            return
+                            
+                        user = parts[1]
+                        db = get_db()
+                        db.collection("usuarios").document(user.lower()).update({
+                            "activo": False
+                        })
+                        send(chat_id, f"🚫 Usuario '{user}' baneado exitosamente")
+                    except Exception as e:
+                        send(chat_id, f"❌ Error: {str(e)}")
+                        health.record_error("ban_command", e)
                     return
-                    
-                user = parts[1]
-                db = get_db()
-                db.collection("usuarios").document(user.lower()).update({
-                    "activo": False
-                })
-                send(chat_id, f"🚫 Usuario '{user}' baneado exitosamente")
-            except Exception as e:
-                send(chat_id, f"❌ Error: {str(e)}")
-                health.record_error("ban_command", e)
-            return
 
-        # ── UNBAN ──
-        if text.startswith("/unban") and es_admin:
-            try:
-                parts = text.split(maxsplit=1)
-                if len(parts) < 2:
-                    send(chat_id, "❌ Uso: /unban username")
+                # ── UNBAN ──
+                if text.startswith("/unban") and es_admin:
+                    try:
+                        parts = text.split(maxsplit=1)
+                        if len(parts) < 2:
+                            send(chat_id, "❌ Uso: /unban username")
+                            return
+                            
+                        user = parts[1]
+                        db = get_db()
+                        db.collection("usuarios").document(user.lower()).update({
+                            "activo": True
+                        })
+                        send(chat_id, f"✅ Usuario '{user}' desbaneado exitosamente")
+                    except Exception as e:
+                        send(chat_id, f"❌ Error: {str(e)}")
+                        health.record_error("unban_command", e)
                     return
-                    
-                user = parts[1]
-                db = get_db()
-                db.collection("usuarios").document(user.lower()).update({
-                    "activo": True
-                })
-                send(chat_id, f"✅ Usuario '{user}' desbaneado exitosamente")
-            except Exception as e:
-                send(chat_id, f"❌ Error: {str(e)}")
-                health.record_error("unban_command", e)
-            return
 
-        # ── REGISTRO ──
-        if text == "/registro":
-            with _estados_lock:
-                _estados[chat_id] = {"step": "user"}
-            send(chat_id, "👤 Por favor, ingresa tu usuario:")
-            return
+                # ── REGISTRO ──
+                if text == "/registro":
+                    with _estados_lock:
+                        _estados[chat_id] = {"step": "user"}
+                    send(chat_id, "👤 Por favor, ingresa tu usuario:")
+                    return
 
-        # ── FLUJO DE REGISTRO ──
-        with _estados_lock:
-            estado = _estados.get(chat_id)
-
-        if estado:
-            if estado["step"] == "user":
+                # ── FLUJO DE REGISTRO ──
                 with _estados_lock:
-                    _estados[chat_id] = {"step": "pass", "user": text}
-                send(chat_id, "🔑 Ahora ingresa tu contraseña:")
-                return
+                    estado = _estados.get(chat_id)
 
-            if estado["step"] == "pass":
-                with _estados_lock:
-                    _estados[chat_id] = {
-                        "step": "confirm",
-                        "user": estado["user"],
-                        "pass": text
-                    }
-                send(chat_id,
-                     f"📋 <b>Confirma tus datos:</b>\n\n"
-                     f"Usuario: {estado['user']}\n"
-                     f"Contraseña: {'•' * len(text)}\n\n"
-                     f"Responde SI para confirmar o NO para cancelar")
-                return
-
-            if estado["step"] == "confirm":
-                if text.upper() == "SI":
-                    uname = estado["user"]
-                    pwd = estado["pass"]
-
-                    db = get_db()
-                    if db.collection("usuarios").document(uname.lower()).get().exists:
-                        send(chat_id, "❌ Este usuario ya existe")
+                if estado:
+                    if estado["step"] == "user":
                         with _estados_lock:
-                            del _estados[chat_id]
+                            _estados[chat_id] = {"step": "pass", "user": text}
+                        send(chat_id, "🔑 Ahora ingresa tu contraseña:")
                         return
 
-                    with _estados_lock:
-                        _pendientes[chat_id] = {
-                            "username": uname,
-                            "password": pwd,
-                            "chat_id": chat_id,
-                            "telegram_user": username
-                        }
+                    if estado["step"] == "pass":
+                        with _estados_lock:
+                            _estados[chat_id] = {
+                                "step": "confirm",
+                                "user": estado["user"],
+                                "pass": text
+                            }
+                        send(chat_id,
+                             f"📋 <b>Confirma tus datos:</b>\n\n"
+                             f"Usuario: {estado['user']}\n"
+                             f"Contraseña: {'•' * len(text)}\n\n"
+                             f"Responde SI para confirmar o NO para cancelar")
+                        return
 
-                    send(chat_id, "⏳ Registro enviado. Esperando aprobación del administrador...")
+                    if estado["step"] == "confirm":
+                        if text.upper() == "SI":
+                            uname = estado["user"]
+                            pwd = estado["pass"]
 
-                    send(ADMIN_CHAT_ID,
-                         f"🔔 <b>NUEVO REGISTRO</b>\n\n"
-                         f"Usuario: {uname}\n"
-                         f"Telegram: @{username}\n"
-                         f"Chat ID: {chat_id}\n\n"
-                         f"/adduser {uname} {pwd} {chat_id}")
+                            db = get_db()
+                            if db.collection("usuarios").document(uname.lower()).get().exists:
+                                send(chat_id, "❌ Este usuario ya existe")
+                                with _estados_lock:
+                                    del _estados[chat_id]
+                                return
 
-                    with _estados_lock:
-                        del _estados[chat_id]
-                    return
-                else:
-                    send(chat_id, "❌ Registro cancelado")
-                    with _estados_lock:
-                        del _estados[chat_id]
-                    return
+                            with _estados_lock:
+                                _pendientes[chat_id] = {
+                                    "username": uname,
+                                    "password": pwd,
+                                    "chat_id": chat_id,
+                                    "telegram_user": username
+                                }
+
+                            send(chat_id, "⏳ Registro enviado. Esperando aprobación del administrador...")
+
+                            send(ADMIN_CHAT_ID,
+                                 f"🔔 <b>NUEVO REGISTRO</b>\n\n"
+                                 f"Usuario: {uname}\n"
+                                 f"Telegram: @{username}\n"
+                                 f"Chat ID: {chat_id}\n\n"
+                                 f"/adduser {uname} {pwd} {chat_id}")
+
+                            with _estados_lock:
+                                del _estados[chat_id]
+                            return
+                        else:
+                            send(chat_id, "❌ Registro cancelado")
+                            with _estados_lock:
+                                del _estados[chat_id]
+                            return
 
         # ── ADDUSER ──
         if text.startswith("/adduser") and es_admin:
