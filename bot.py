@@ -28,7 +28,7 @@ from firebase_manager import (
     ADMIN_CHAT_ID,
 )
 
-API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+API = f"https://api.telegram.org/bot{8764142166:AAGvhBc6M0xJLB0yvrFF4AITD8ZRYLMM9wg}"
 
 _estados = {}
 _pendientes = {}
