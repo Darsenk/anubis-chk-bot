@@ -197,18 +197,40 @@ def obtener_usuario(username):
 
 
 def obtener_todos_usuarios():
+    """Obtener todos los usuarios con verificación de datos"""
     try:
         db = get_db()
-        usuarios = []
-
-        for doc in db.collection("usuarios").stream():
+        users = []
+        
+        # Obtener todos los documentos de la colección usuarios
+        docs = db.collection("usuarios").stream()
+        
+        for doc in docs:
             data = doc.to_dict()
-            data["_id"] = doc.id
-            usuarios.append(data)
-
-        return usuarios
-
-    except:
+            
+            # Verificar que el documento tenga los campos necesarios
+            if data:
+                # Asegurarse de que el ID del documento también se incluya
+                data['doc_id'] = doc.id
+                
+                # Convertir chat_id a string si es necesario
+                if 'chat_id' in data and data['chat_id']:
+                    data['chat_id'] = str(data['chat_id'])
+                
+                # Asegurar que username exista
+                if 'username' not in data:
+                    data['username'] = doc.id
+                
+                users.append(data)
+                print(f"✅ Usuario encontrado: {data.get('username', 'N/A')}")
+        
+        print(f"📊 Total de usuarios encontrados: {len(users)}")
+        return users
+        
+    except Exception as e:
+        print(f"❌ Error obteniendo usuarios: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 # ══════════════════════════════════════════════════════════════
