@@ -113,7 +113,7 @@ def registrar_usuario(username, password, chat_id):
 
         ref.set({
             "username": username,
-            "password": _hash(password),
+            "password_hash": _hash(password),
             "chat_id": str(chat_id),
             "lives_count": 0,
             "activo": True,
@@ -150,7 +150,7 @@ def verificar_login(username, password):
         if data.get("bloqueado"):
             return {"ok": False, "error": "Usuario bloqueado"}
 
-        if data["password"] != _hash(password):
+        if data.get("password_hash") != _hash(password):
             intentos = data.get("intentos_fallidos", 0) + 1
 
             ref.update({"intentos_fallidos": intentos})
@@ -176,6 +176,17 @@ def verificar_login(username, password):
 # ══════════════════════════════════════════════════════════════
 # CONSULTAS
 # ══════════════════════════════════════════════════════════════
+def get_usuario_por_chat(chat_id):
+    try:
+        db = get_db()
+        docs = db.collection("usuarios").where("chat_id", "==", str(chat_id)).stream()
+
+        for doc in docs:
+            return doc.to_dict()
+
+        return None
+    except:
+        return None
 
 def obtener_usuario(username):
     if username in _cache:
