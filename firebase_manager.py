@@ -20,26 +20,49 @@ from datetime import datetime
 
 def _cargar_config():
     token = os.environ.get("TELEGRAM_TOKEN")
-    admin_id = os.environ.get("ADMIN_CHAT_ID")
-    creator_username = os.environ.get("CREATOR_USERNAME", "@AnubisCHK")
+    admin_id = os.environ.get("ADMIN_CHAT_ID", "7448403516")
+    creator_username = os.environ.get("CREATOR_USERNAME", "ProChekCc")
     firebase_creds = os.environ.get("FIREBASE_CREDENTIALS")
 
-    if token and admin_id and firebase_creds:
-        return token, str(admin_id), creator_username, json.loads(firebase_creds)
+    # Si hay variables de entorno, usarlas
+    if token and firebase_creds:
+        try:
+            creds_dict = json.loads(firebase_creds)
+            return token, str(admin_id), creator_username, creds_dict
+        except:
+            pass
 
+    # Intentar cargar desde archivos
     try:
-        import config
-        return (
-            getattr(config, "TELEGRAM_TOKEN"),
-            str(getattr(config, "ADMIN_CHAT_ID")),
-            getattr(config, "CREATOR_USERNAME", "@AnubisCHK"),
-            getattr(config, "FIREBASE_CREDENTIALS")
-        )
-    except:
-        raise RuntimeError("❌ Configuración faltante")
+        _BASE = os.path.dirname(os.path.abspath(__file__))
+        
+        # Cargar config.json
+        config_file = os.path.join(_BASE, "config.json")
+        if os.path.exists(config_file):
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                token = config.get("telegram_token", token)
+                admin_id = config.get("admin_chat_id", admin_id)
+        
+        # Cargar firebase-credentials.json
+        cred_file = os.path.join(_BASE, "firebase-credentials.json")
+        if os.path.exists(cred_file):
+            with open(cred_file, 'r', encoding='utf-8') as f:
+                firebase_creds = json.load(f)
+        
+        if token and firebase_creds:
+            return token, str(admin_id), creator_username, firebase_creds
+            
+    except Exception as e:
+        print(f"⚠️ Error cargando config: {e}")
+    
+    raise RuntimeError("❌ Configuración faltante - verifica TELEGRAM_TOKEN y credenciales de Firebase")
 
 
 TELEGRAM_TOKEN, ADMIN_CHAT_ID, CREATOR_USERNAME, FIREBASE_CREDS = _cargar_config()
+
+print(f"✅ Config cargada - Admin ID: {ADMIN_CHAT_ID}")
+print(f"✅ Creator: @{CREATOR_USERNAME}")
 
 # ══════════════════════════════════════════════════════════════
 # FIREBASE INIT
@@ -116,14 +139,22 @@ def get_system_info():
             "cpu_percent": psutil.cpu_percent(interval=1),
             "memory_percent": psutil.virtual_memory().percent,
             "disk_percent": psutil.disk_usage('/').percent,
-            "boot_time": datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S")
+            "boot_time": datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S"),
+            "firebase_project": FIREBASE_CREDS.get("project_id", "N/A"),
+            "admin_id": ADMIN_CHAT_ID,
+            "creator": CREATOR_USERNAME,
+            "version": "2.0"
         }
     except:
         return {
             "cpu_percent": 0,
             "memory_percent": 0,
             "disk_percent": 0,
-            "boot_time": "N/A"
+            "boot_time": "N/A",
+            "firebase_project": FIREBASE_CREDS.get("project_id", "N/A"),
+            "admin_id": ADMIN_CHAT_ID,
+            "creator": CREATOR_USERNAME,
+            "version": "2.0"
         }
 
 # ══════════════════════════════════════════════════════════════
@@ -421,12 +452,14 @@ def stats_globales():
 
         total = len(usuarios)
         activos = sum(1 for u in usuarios if u.get("activo"))
+        inactivos = total - activos
         bloqueados = sum(1 for u in usuarios if u.get("bloqueado"))
         lives = sum(u.get("lives_count", 0) for u in usuarios)
 
         return {
             "total": total,
             "activos": activos,
+            "inactivos": inactivos,
             "bloqueados": bloqueados,
             "lives": lives
         }
@@ -435,6 +468,7 @@ def stats_globales():
         return {
             "total": 0,
             "activos": 0,
+            "inactivos": 0,
             "bloqueados": 0,
             "lives": 0
         }
