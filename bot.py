@@ -34,6 +34,7 @@ from firebase_manager import (
     TELEGRAM_TOKEN,
     ADMIN_CHAT_ID,
     CREATOR_USERNAME,
+    db,  # Importar la instancia de Firestore
 )
 
 API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -258,13 +259,18 @@ def handle(msg):
                 f"📨 Solicitudes pendientes: <b>{pending_count}</b>\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"<b>COMANDOS</b>\n\n"
+                f"<b>Usuarios:</b>\n"
                 f"/requests — Ver solicitudes pendientes\n"
                 f"/users — Ver usuarios\n"
                 f"/adduser [user] [pass] — Crear usuario\n"
                 f"/block [user] — Bloquear\n"
                 f"/unblock [user] — Desbloquear\n"
                 f"/delete [user] — Eliminar\n"
-                f"/resetpass [user] [pass] — Cambiar contraseña\n"
+                f"/resetpass [user] [pass] — Cambiar contraseña\n\n"
+                f"<b>Lives:</b>\n"
+                f"/lives — Ver todas las lives\n"
+                f"/setmod [live] [moderador] — Asignar moderador\n\n"
+                f"<b>Sistema:</b>\n"
                 f"/logs — Ver logs"
             )
             
@@ -490,6 +496,85 @@ def handle(msg):
                 msg += f"• <b>{tipo}</b>: {data}\n"
             
             send(chat_id, msg)
+            return
+
+        # ── LIVES ──
+        if text == "/lives":
+            try:
+                # Obtener todas las lives de Firebase
+                lives_ref = db.collection('lives').collection('anon')
+                lives_docs = lives_ref.stream()
+                
+                lives_list = []
+                for doc in lives_docs:
+                    live_data = doc.to_dict()
+                    live_data['id'] = doc.id
+                    lives_list.append(live_data)
+                
+                if not lives_list:
+                    send(chat_id, "❌ No hay lives disponibles")
+                    return
+                
+                msg = "📺 <b>LIVES DISPONIBLES</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                
+                for live in lives_list:
+                    live_id = live.get('id', 'N/A')
+                    moderador = live.get('moderador', 'Sin asignar')
+                    tarjetas = live.get('tarjetas', [])
+                    num_tarjetas = len(tarjetas) if isinstance(tarjetas, list) else 0
+                    
+                    msg += (f"🎬 <b>{live_id}</b>\n"
+                           f"👤 Moderador: <code>{moderador}</code>\n"
+                           f"💳 Tarjetas: {num_tarjetas}\n"
+                           f"━━━━━━━━━━━━━━━━━━━━━━\n\n")
+                
+                msg += "\n💡 Para asignar moderador:\n"
+                msg += "<code>/setmod [nombre_live] [usuario_mod]</code>\n\n"
+                msg += "Ejemplo: <code>/setmod live1 juan_mod</code>"
+                
+                send(chat_id, msg)
+                
+            except Exception as e:
+                send(chat_id, f"❌ Error obteniendo lives: {str(e)}")
+                health.record_error("lives_command", e)
+            return
+
+        # ── SET MODERATOR ──
+        if text.startswith("/setmod"):
+            parts = text.split()
+            if len(parts) != 3:
+                send(chat_id,
+                     "❌ Uso: /setmod [nombre_live] [usuario_moderador]\n\n"
+                     "Ejemplo: <code>/setmod live1 juan_mod</code>")
+                return
+            
+            live_name = parts[1]
+            moderador = parts[2]
+            
+            try:
+                # Actualizar el moderador en Firebase
+                live_ref = db.collection('lives').collection('anon').document(live_name)
+                
+                # Verificar si la live existe
+                live_doc = live_ref.get()
+                
+                if not live_doc.exists:
+                    send(chat_id, f"❌ La live <code>{live_name}</code> no existe")
+                    return
+                
+                # Actualizar el moderador
+                live_ref.update({
+                    'moderador': moderador
+                })
+                
+                send(chat_id,
+                     f"✅ <b>Moderador asignado</b>\n\n"
+                     f"📺 Live: <code>{live_name}</code>\n"
+                     f"👤 Moderador: <code>{moderador}</code>")
+                
+            except Exception as e:
+                send(chat_id, f"❌ Error asignando moderador: {str(e)}")
+                health.record_error("setmod_command", e)
             return
 
     except Exception as e:
