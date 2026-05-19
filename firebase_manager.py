@@ -443,6 +443,138 @@ def obtener_logs_recientes(limite=20):
         return []
 
 # ══════════════════════════════════════════════════════════════
+# MODERADORES
+# ══════════════════════════════════════════════════════════════
+
+def agregar_moderador(chat_id, username=None):
+    """Agregar un moderador"""
+    try:
+        db = get_db()
+        mod_id = str(chat_id)
+        
+        ref = db.collection("moderadores").document(mod_id)
+        ref.set({
+            "chat_id": mod_id,
+            "username": username or "N/A",
+            "agregado_at": firestore.SERVER_TIMESTAMP,
+            "activo": True
+        })
+        
+        log_evento("moderador_agregado", {"chat_id": mod_id, "username": username})
+        return True
+    except Exception as e:
+        print(f"❌ Error agregando moderador: {e}")
+        return False
+
+def eliminar_moderador(chat_id):
+    """Eliminar un moderador"""
+    try:
+        db = get_db()
+        db.collection("moderadores").document(str(chat_id)).delete()
+        log_evento("moderador_eliminado", str(chat_id))
+        return True
+    except:
+        return False
+
+def es_moderador(chat_id):
+    """Verifica si un chat_id es moderador"""
+    try:
+        db = get_db()
+        doc = db.collection("moderadores").document(str(chat_id)).get()
+        if doc.exists:
+            data = doc.to_dict()
+            return data.get("activo", False)
+        return False
+    except:
+        return False
+
+def obtener_moderadores():
+    """Obtiene la lista de moderadores"""
+    try:
+        db = get_db()
+        docs = db.collection("moderadores").where("activo", "==", True).stream()
+        
+        mods = []
+        for doc in docs:
+            data = doc.to_dict()
+            mods.append(data)
+        
+        return mods
+    except Exception as e:
+        print(f"❌ Error obteniendo moderadores: {e}")
+        return []
+
+# ══════════════════════════════════════════════════════════════
+# GESTIÓN DE LIVES
+# ══════════════════════════════════════════════════════════════
+
+def agregar_lives(username, cantidad):
+    """Agrega lives a un usuario"""
+    try:
+        db = get_db()
+        ref = db.collection("usuarios").document(username.lower())
+        doc = ref.get()
+        
+        if not doc.exists:
+            return {"ok": False, "error": "Usuario no encontrado"}
+        
+        ref.update({
+            "lives_count": firestore.Increment(cantidad)
+        })
+        
+        log_evento("lives_agregadas", {"username": username, "cantidad": cantidad})
+        return {"ok": True, "mensaje": f"Se agregaron {cantidad} lives a {username}"}
+        
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def quitar_lives(username, cantidad):
+    """Quita lives a un usuario"""
+    try:
+        db = get_db()
+        ref = db.collection("usuarios").document(username.lower())
+        doc = ref.get()
+        
+        if not doc.exists:
+            return {"ok": False, "error": "Usuario no encontrado"}
+        
+        data = doc.to_dict()
+        lives_actuales = data.get("lives_count", 0)
+        
+        if lives_actuales < cantidad:
+            return {"ok": False, "error": f"El usuario solo tiene {lives_actuales} lives"}
+        
+        ref.update({
+            "lives_count": firestore.Increment(-cantidad)
+        })
+        
+        log_evento("lives_quitadas", {"username": username, "cantidad": cantidad})
+        return {"ok": True, "mensaje": f"Se quitaron {cantidad} lives a {username}"}
+        
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def establecer_lives(username, cantidad):
+    """Establece un número exacto de lives"""
+    try:
+        db = get_db()
+        ref = db.collection("usuarios").document(username.lower())
+        doc = ref.get()
+        
+        if not doc.exists:
+            return {"ok": False, "error": "Usuario no encontrado"}
+        
+        ref.update({
+            "lives_count": cantidad
+        })
+        
+        log_evento("lives_establecidas", {"username": username, "cantidad": cantidad})
+        return {"ok": True, "mensaje": f"Lives de {username} establecidas a {cantidad}"}
+        
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ══════════════════════════════════════════════════════════════
 # STATS GLOBALES
 # ══════════════════════════════════════════════════════════════
 
