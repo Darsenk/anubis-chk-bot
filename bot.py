@@ -34,7 +34,7 @@ from firebase_manager import (
     TELEGRAM_TOKEN,
     ADMIN_CHAT_ID,
     CREATOR_USERNAME,
-    db,  # Importar la instancia de Firestore
+    
 )
 
 API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
