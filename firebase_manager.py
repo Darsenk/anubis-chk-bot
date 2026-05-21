@@ -555,6 +555,73 @@ def establecer_lives(username, cantidad):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+def obtener_lives(username):
+    """
+    Obtiene las lives (tarjetas) de un usuario
+    Retorna: dict con 'ok', 'data' (lista de tarjetas), 'count'
+    """
+    try:
+        db = get_db()
+        ref = db.collection("usuarios").document(username.lower())
+        doc = ref.get()
+        
+        if not doc.exists:
+            return {"ok": False, "error": "Usuario no encontrado"}
+        
+        data = doc.to_dict()
+        lives_count = data.get('lives_count', 0)
+        
+        # Si quieres devolver las tarjetas almacenadas (si las hay)
+        lives = data.get('lives', [])
+        
+        return {
+            "ok": True,
+            "data": lives,
+            "count": lives_count
+        }
+        
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def contar_lives(username):
+    """
+    Cuenta cuántas lives tiene un usuario
+    Retorna: número de lives o 0
+    """
+    try:
+        db = get_db()
+        ref = db.collection("usuarios").document(username.lower())
+        doc = ref.get()
+        
+        if not doc.exists:
+            return 0
+        
+        data = doc.to_dict()
+        return data.get('lives_count', 0)
+        
+    except Exception as e:
+        return 0
+
+def formatear_tarjeta(tarjeta):
+    """
+    Formatea una tarjeta para mostrar en Telegram
+    Ejemplo: 4111111111111111|12|2025|123
+    """
+    try:
+        if isinstance(tarjeta, dict):
+            numero = tarjeta.get('numero', '')
+            mes = tarjeta.get('mes', '')
+            anio = tarjeta.get('anio', '')
+            cvv = tarjeta.get('cvv', '')
+            return f"{numero}|{mes}|{anio}|{cvv}"
+        elif isinstance(tarjeta, str):
+            # Si ya viene formateada, devolverla tal cual
+            return tarjeta
+        else:
+            return str(tarjeta)
+    except:
+        return str(tarjeta)
+
 # ══════════════════════════════════════════════════════════════
 # GESTIÓN DE LIVES/TARJETAS (FIREBASE)
 # ══════════════════════════════════════════════════════════════
@@ -708,3 +775,9 @@ def stats_globales():
             "bloqueados": 0,
             "lives": 0
         }
+
+# ══════════════════════════════════════════════════════════════
+# EXPORTAR DB PARA OTROS MÓDULOS
+# ══════════════════════════════════════════════════════════════
+
+db = get_db()
