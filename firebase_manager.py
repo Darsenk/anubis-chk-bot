@@ -583,23 +583,40 @@ def obtener_lives(username):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-def contar_lives(username):
+def contar_lives(username=None):
     """
-    Cuenta cuántas lives tiene un usuario
+    Cuenta cuántas lives hay:
+    - Si se pasa username: cuenta las lives de ese usuario
+    - Si NO se pasa username: cuenta todas las lives disponibles en Firebase (tarjetas)
     Retorna: número de lives o 0
     """
     try:
         db = get_db()
-        ref = db.collection("usuarios").document(username.lower())
-        doc = ref.get()
         
-        if not doc.exists:
-            return 0
+        # Si se especifica un usuario, contar sus lives
+        if username:
+            ref = db.collection("usuarios").document(username.lower())
+            doc = ref.get()
+            
+            if not doc.exists:
+                return 0
+            
+            data = doc.to_dict()
+            return data.get('lives_count', 0)
         
-        data = doc.to_dict()
-        return data.get('lives_count', 0)
+        # Si NO se especifica usuario, contar todas las tarjetas en Firebase
+        else:
+            tarjetas_ref = db.collection('lives').document('anon').collection('tarjetas')
+            docs = tarjetas_ref.stream()
+            
+            count = 0
+            for doc in docs:
+                count += 1
+            
+            return count
         
     except Exception as e:
+        print(f"❌ Error en contar_lives: {e}")
         return 0
 
 def formatear_tarjeta(tarjeta):
