@@ -31,11 +31,20 @@ from firebase_manager import (
     cambiar_password,
     obtener_logs_recientes,
     get_system_info,
-    get_db,  # ✅ ESTO ES LO QUE FALTABA - IMPORTAR get_db()
+    agregar_moderador,
+    eliminar_moderador,
+    es_moderador,
+    obtener_moderadores,
+    agregar_lives,
+    quitar_lives,
+    establecer_lives,
+    obtener_lives,
+    contar_lives,
+    formatear_tarjeta,
     TELEGRAM_TOKEN,
     ADMIN_CHAT_ID,
     CREATOR_USERNAME,
-    
+    db,  # Importar la instancia de Firestore
 )
 
 API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -240,6 +249,93 @@ def handle(msg):
                 send(chat_id, f"❌ {res['error']}")
             return
 
+        # ── MODERATOR CHECK ──
+        is_moderador = es_moderador(chat_id)
+
+        # ── COMANDOS PARA MODERADORES Y ADMIN ──
+        # Lives (ver tarjetas) - disponible para moderadores
+        if text.startswith("/lives") or text.startswith("/viewlives"):
+            if not (is_admin or is_moderador):
+                return
+            
+            try:
+                # Parsear página si se especifica
+                parts = text.split()
+                pagina = 0
+                if len(parts) > 1:
+                    try:
+                        pagina = int(parts[1]) - 1
+                        if pagina < 0:
+                            pagina = 0
+                    except:
+                        pagina = 0
+                
+                # Obtener tarjetas con paginación (10 por página)
+                limite = 10
+                offset = pagina * limite
+                
+                resultado = obtener_lives(limite=limite, offset=offset)
+                
+                if not resultado["ok"]:
+                    send(chat_id, f"❌ Error: {resultado['error']}")
+                    return
+                
+                tarjetas = resultado["tarjetas"]
+                total = resultado["total"]
+                tiene_mas = resultado["tiene_mas"]
+                
+                if not tarjetas:
+                    send(chat_id, "❌ No hay lives disponibles")
+                    return
+                
+                msg = "📺 <b>LIVES DISPONIBLES</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                
+                for tarjeta in tarjetas:
+                    card = tarjeta.get("card", "")
+                    bank = tarjeta.get("bank", "N/A")
+                    
+                    # Formatear el número de tarjeta
+                    card_formatted = formatear_tarjeta(card)
+                    
+                    msg += f"💳 <code>{card_formatted}</code>\n"
+                    msg += f"🏦 <b>{bank}</b>\n"
+                    msg += f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                
+                # Información de paginación
+                pagina_actual = pagina + 1
+                total_paginas = (total + limite - 1) // limite
+                
+                msg += f"📊 Página {pagina_actual}/{total_paginas}\n"
+                msg += f"📊 Total: {total} tarjetas\n\n"
+                
+                # Botones de navegación
+                keyboard = {"inline_keyboard": []}
+                
+                row = []
+                if pagina > 0:
+                    row.append({"text": "⬅️ Anterior", "callback_data": f"lives_page_{pagina - 1}"})
+                
+                if tiene_mas:
+                    row.append({"text": "Siguiente ➡️", "callback_data": f"lives_page_{pagina + 1}"})
+                
+                if row:
+                    keyboard["inline_keyboard"].append(row)
+                
+                # Botón de recargar
+                keyboard["inline_keyboard"].append([
+                    {"text": "🔄 Buscar más lives", "callback_data": f"lives_page_{pagina}"}
+                ])
+                
+                send(chat_id, msg, reply_markup=keyboard)
+                
+            except Exception as e:
+                send(chat_id, f"❌ Error obteniendo lives: {str(e)}")
+                health.record_error("lives_command", e)
+                print(f"Error en /lives: {e}")
+                import traceback
+                traceback.print_exc()
+            return
+
         # ── ADMIN ONLY ──
         if not is_admin:
             return
@@ -248,6 +344,7 @@ def handle(msg):
         if text == "/panel":
             stats = stats_globales()
             pending_count = len(get_all_requests())
+            total_lives = contar_lives()
             
             msg_text = (
                 f"🎛 <b>PANEL DE ADMINISTRACIÓN</b>\n"
@@ -256,23 +353,30 @@ def handle(msg):
                 f"✅ Activos: <b>{stats['activos']}</b>\n"
                 f"💤 Inactivos: <b>{stats['inactivos']}</b>\n"
                 f"🚫 Bloqueados: <b>{stats['bloqueados']}</b>\n"
-                f"💳 Lives totales: <b>{stats['lives']}</b>\n"
+                f"💳 Lives de usuarios: <b>{stats['lives']}</b>\n"
+                f"📺 Lives disponibles: <b>{total_lives}</b>\n"
                 f"📨 Solicitudes pendientes: <b>{pending_count}</b>\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"<b>COMANDOS</b>\n\n"
                 f"<b>Usuarios:</b>\n"
                 f"/requests — Ver solicitudes pendientes\n"
-                f"/users — Ver usuarios\n"
+                f"/users — Ver todos los usuarios\n"
                 f"/adduser [user] [pass] — Crear usuario\n"
-                f"/block [user] — Bloquear\n"
-                f"/unblock [user] — Desbloquear\n"
-                f"/delete [user] — Eliminar\n"
+                f"/block [user] — Bloquear usuario\n"
+                f"/unblock [user] — Desbloquear usuario\n"
+                f"/delete [user] — Eliminar usuario\n"
                 f"/resetpass [user] [pass] — Cambiar contraseña\n\n"
+                f"<b>Moderadores:</b>\n"
+                f"/mods — Ver moderadores\n"
+                f"/addmod [chat_id] [username] — Agregar moderador\n"
+                f"/delmod [chat_id] — Eliminar moderador\n\n"
                 f"<b>Lives:</b>\n"
-                f"/lives — Ver todas las lives\n"
-                f"/setmod [live] [moderador] — Asignar moderador\n\n"
+                f"/lives [página] — Ver tarjetas disponibles\n"
+                f"/addlives [user] [cant] — Agregar lives a usuario\n"
+                f"/remlives [user] [cant] — Quitar lives a usuario\n"
+                f"/setlives [user] [cant] — Establecer lives exactas\n\n"
                 f"<b>Sistema:</b>\n"
-                f"/logs — Ver logs"
+                f"/logs — Ver logs recientes"
             )
             
             send(chat_id, msg_text)
@@ -401,19 +505,23 @@ def handle(msg):
             else:
                 send(chat_id,
                      "❌ Uso:\n"
-                     "<code>/adduser [usuario]</code> (contraseña auto)\n"
+                     "<code>/adduser [usuario]</code> (genera contraseña)\n"
                      "<code>/adduser [usuario] [contraseña]</code>")
                 return
             
-            res = registrar_usuario(user, p, "0")
-            
-            if res["ok"]:
-                send(chat_id,
-                     f"✅ Usuario creado\n\n"
-                     f"Usuario: <code>{user}</code>\n"
-                     f"Contraseña: <code>{p}</code>")
-            else:
-                send(chat_id, f"❌ {res['error']}")
+            try:
+                res = registrar_usuario(user, p, "0")
+                
+                if res["ok"]:
+                    send(chat_id,
+                         f"✅ Usuario creado\n\n"
+                         f"Usuario: <code>{user}</code>\n"
+                         f"Contraseña: <code>{p}</code>")
+                else:
+                    send(chat_id, f"❌ Error: {res['error']}")
+            except Exception as e:
+                send(chat_id, f"❌ Error: {str(e)}")
+                health.record_error("adduser_command", e)
             return
 
         # ── BLOCK ──
@@ -425,9 +533,9 @@ def handle(msg):
             
             user = parts[1]
             if bloquear_usuario(user):
-                send(chat_id, f"✅ Usuario <code>{user}</code> bloqueado")
+                send(chat_id, f"✅ Usuario <b>{user}</b> bloqueado")
             else:
-                send(chat_id, f"❌ Error bloqueando <code>{user}</code>")
+                send(chat_id, f"❌ Error bloqueando usuario")
             return
 
         # ── UNBLOCK ──
@@ -439,9 +547,9 @@ def handle(msg):
             
             user = parts[1]
             if desbloquear_usuario(user):
-                send(chat_id, f"✅ Usuario <code>{user}</code> desbloqueado")
+                send(chat_id, f"✅ Usuario <b>{user}</b> desbloqueado")
             else:
-                send(chat_id, f"❌ Error desbloqueando <code>{user}</code>")
+                send(chat_id, f"❌ Error desbloqueando usuario")
             return
 
         # ── DELETE ──
@@ -453,9 +561,9 @@ def handle(msg):
             
             user = parts[1]
             if eliminar_usuario(user):
-                send(chat_id, f"✅ Usuario <code>{user}</code> eliminado")
+                send(chat_id, f"✅ Usuario <b>{user}</b> eliminado")
             else:
-                send(chat_id, f"❌ Error eliminando <code>{user}</code>")
+                send(chat_id, f"❌ Error eliminando usuario")
             return
 
         # ── RESET PASSWORD ──
@@ -463,20 +571,18 @@ def handle(msg):
             parts = text.split()
             if len(parts) != 3:
                 send(chat_id,
-                     "❌ Uso:\n"
-                     "<code>/resetpass [usuario] [nueva_contraseña]</code>")
+                     "❌ Uso: /resetpass [usuario] [nueva_contraseña]\n\n"
+                     "Ejemplo: <code>/resetpass juan nuevapass123</code>")
                 return
             
-            user = parts[1]
-            new_pass = parts[2]
-            
+            user, new_pass = parts[1], parts[2]
             if cambiar_password(user, new_pass):
                 send(chat_id,
-                     f"✅ Contraseña cambiada\n\n"
+                     f"✅ Contraseña actualizada\n\n"
                      f"Usuario: <code>{user}</code>\n"
                      f"Nueva contraseña: <code>{new_pass}</code>")
             else:
-                send(chat_id, f"❌ Error cambiando contraseña de <code>{user}</code>")
+                send(chat_id, f"❌ Error cambiando contraseña")
             return
 
         # ── LOGS ──
@@ -497,41 +603,160 @@ def handle(msg):
             send(chat_id, msg)
             return
 
-        # ── LIVES ──
-        if text == "/lives":
+        # ── AGREGAR MODERADOR ──
+        if text.startswith("/addmod"):
+            parts = text.split()
+            if len(parts) < 2:
+                send(chat_id, 
+                     "❌ Uso: /addmod [chat_id] [username_opcional]\n\n"
+                     "Ejemplo: <code>/addmod 123456789 juan_mod</code>")
+                return
+            
+            mod_chat_id = parts[1]
+            mod_username = parts[2] if len(parts) > 2 else None
+            
+            if agregar_moderador(mod_chat_id, mod_username):
+                send(chat_id, 
+                     f"✅ Moderador agregado\n\n"
+                     f"Chat ID: <code>{mod_chat_id}</code>\n"
+                     f"Username: <code>{mod_username or 'N/A'}</code>")
+                
+                # Notificar al nuevo moderador
+                try:
+                    send(mod_chat_id,
+                         "🎉 <b>¡Fuiste agregado como MODERADOR!</b>\n\n"
+                         "Ahora puedes:\n"
+                         "• Ver lives disponibles con /viewlives\n"
+                         "• Agregar usuarios con /adduser\n"
+                         "• Eliminar usuarios con /deluser\n"
+                         "• Ver estadísticas con /stats")
+                except:
+                    pass
+            else:
+                send(chat_id, "❌ Error agregando moderador")
+            return
+
+        # ── ELIMINAR MODERADOR ──
+        if text.startswith("/delmod"):
+            parts = text.split()
+            if len(parts) != 2:
+                send(chat_id, "❌ Uso: /delmod [chat_id]")
+                return
+            
+            mod_chat_id = parts[1]
+            
+            if eliminar_moderador(mod_chat_id):
+                send(chat_id, f"✅ Moderador eliminado\n\nChat ID: <code>{mod_chat_id}</code>")
+                
+                # Notificar al ex-moderador
+                try:
+                    send(mod_chat_id,
+                         "⚠️ <b>Tu rol de moderador fue removido</b>\n\n"
+                         "Ya no tienes permisos de moderador.")
+                except:
+                    pass
+            else:
+                send(chat_id, "❌ Error eliminando moderador")
+            return
+
+        # ── VER MODERADORES ──
+        if text == "/mods":
+            moderadores = obtener_moderadores()
+            
+            if not moderadores:
+                send(chat_id, "❌ No hay moderadores registrados")
+                return
+            
+            msg = "👥 <b>MODERADORES</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            
+            for mod in moderadores:
+                mod_chat_id = mod.get("chat_id", "N/A")
+                mod_username = mod.get("username", "N/A")
+                msg += f"👤 <code>{mod_username}</code>\n"
+                msg += f"🆔 Chat ID: <code>{mod_chat_id}</code>\n\n"
+            
+            send(chat_id, msg)
+            return
+
+        # ── AGREGAR LIVES A USUARIO ──
+        if text.startswith("/addlives"):
+            parts = text.split()
+            if len(parts) != 3:
+                send(chat_id,
+                     "❌ Uso: /addlives [usuario] [cantidad]\n\n"
+                     "Ejemplo: <code>/addlives juan 10</code>")
+                return
+            
+            username = parts[1]
             try:
-                # ✅ CORREGIDO: Usar get_db() en lugar de db directamente
-                db = get_db()
-                
-                # Obtener la colección lives -> subcoleción anon
-                lives_ref = db.collection('lives').document('anon').collection('tarjetas')
-                lives_docs = lives_ref.stream()
-                
-                lives_list = []
-                for doc in lives_docs:
-                    live_data = doc.to_dict()
-                    live_data['id'] = doc.id
-                    lives_list.append(live_data)
-                
-                if not lives_list:
-                    send(chat_id, "❌ No hay lives disponibles")
+                cantidad = int(parts[2])
+                if cantidad <= 0:
+                    send(chat_id, "❌ La cantidad debe ser mayor a 0")
                     return
-                
-                msg = "📺 <b>LIVES DISPONIBLES</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                
-                for live in lives_list[:10]:  # Mostrar solo las primeras 10
-                    live_id = live.get('id', 'N/A')
-                    
-                    msg += f"💳 <code>{live_id}</code>\n"
-                
-                msg += f"\n📊 Total: <b>{len(lives_list)}</b> tarjetas\n"
-                
-                send(chat_id, msg)
-                
-            except Exception as e:
-                send(chat_id, f"❌ Error obteniendo lives: {str(e)}")
-                health.record_error("lives_command", e)
-                print(f"❌ Error detallado en /lives: {traceback.format_exc()}")
+            except:
+                send(chat_id, "❌ La cantidad debe ser un número")
+                return
+            
+            resultado = agregar_lives(username, cantidad)
+            
+            if resultado["ok"]:
+                send(chat_id, f"✅ {resultado['mensaje']}")
+            else:
+                send(chat_id, f"❌ Error: {resultado['error']}")
+            return
+
+        # ── QUITAR LIVES A USUARIO ──
+        if text.startswith("/remlives"):
+            parts = text.split()
+            if len(parts) != 3:
+                send(chat_id,
+                     "❌ Uso: /remlives [usuario] [cantidad]\n\n"
+                     "Ejemplo: <code>/remlives juan 5</code>")
+                return
+            
+            username = parts[1]
+            try:
+                cantidad = int(parts[2])
+                if cantidad <= 0:
+                    send(chat_id, "❌ La cantidad debe ser mayor a 0")
+                    return
+            except:
+                send(chat_id, "❌ La cantidad debe ser un número")
+                return
+            
+            resultado = quitar_lives(username, cantidad)
+            
+            if resultado["ok"]:
+                send(chat_id, f"✅ {resultado['mensaje']}")
+            else:
+                send(chat_id, f"❌ Error: {resultado['error']}")
+            return
+
+        # ── ESTABLECER LIVES DE USUARIO ──
+        if text.startswith("/setlives"):
+            parts = text.split()
+            if len(parts) != 3:
+                send(chat_id,
+                     "❌ Uso: /setlives [usuario] [cantidad]\n\n"
+                     "Ejemplo: <code>/setlives juan 20</code>")
+                return
+            
+            username = parts[1]
+            try:
+                cantidad = int(parts[2])
+                if cantidad < 0:
+                    send(chat_id, "❌ La cantidad debe ser 0 o mayor")
+                    return
+            except:
+                send(chat_id, "❌ La cantidad debe ser un número")
+                return
+            
+            resultado = establecer_lives(username, cantidad)
+            
+            if resultado["ok"]:
+                send(chat_id, f"✅ {resultado['mensaje']}")
+            else:
+                send(chat_id, f"❌ Error: {resultado['error']}")
             return
 
         # ── SET MODERATOR ──
@@ -547,11 +772,8 @@ def handle(msg):
             moderador = parts[2]
             
             try:
-                # ✅ CORREGIDO: Usar get_db() en lugar de db directamente
-                db = get_db()
-                
                 # Actualizar el moderador en Firebase
-                live_ref = db.collection('lives').document('anon').collection('tarjetas').document(live_name)
+                live_ref = db.collection('lives').collection('anon').document(live_name)
                 
                 # Verificar si la live existe
                 live_doc = live_ref.get()
@@ -573,7 +795,6 @@ def handle(msg):
             except Exception as e:
                 send(chat_id, f"❌ Error asignando moderador: {str(e)}")
                 health.record_error("setmod_command", e)
-                print(f"❌ Error detallado en /setmod: {traceback.format_exc()}")
             return
 
     except Exception as e:
@@ -593,8 +814,97 @@ def handle_callback(callback):
         data = callback.get("data", "")
         message = callback.get("message", {})
         chat_id = str(message.get("chat", {}).get("id", ""))
+        message_id = message.get("message_id")
         
-        if not chat_id or chat_id != ADMIN_CHAT_ID:
+        # Permitir callbacks tanto de admin como de moderadores para paginación de lives
+        is_admin_or_mod = (chat_id == ADMIN_CHAT_ID or es_moderador(chat_id))
+        
+        # ── PAGINACIÓN DE LIVES ──
+        if data.startswith("lives_page_"):
+            if not is_admin_or_mod:
+                return
+            
+            try:
+                pagina = int(data.replace("lives_page_", ""))
+                limite = 10
+                offset = pagina * limite
+                
+                resultado = obtener_lives(limite=limite, offset=offset)
+                
+                if not resultado["ok"]:
+                    send(chat_id, f"❌ Error: {resultado['error']}")
+                    return
+                
+                tarjetas = resultado["tarjetas"]
+                total = resultado["total"]
+                tiene_mas = resultado["tiene_mas"]
+                
+                if not tarjetas:
+                    send(chat_id, "❌ No hay lives disponibles")
+                    return
+                
+                msg = "📺 <b>LIVES DISPONIBLES</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                
+                for tarjeta in tarjetas:
+                    card = tarjeta.get("card", "")
+                    bank = tarjeta.get("bank", "N/A")
+                    
+                    # Formatear el número de tarjeta
+                    card_formatted = formatear_tarjeta(card)
+                    
+                    msg += f"💳 <code>{card_formatted}</code>\n"
+                    msg += f"🏦 <b>{bank}</b>\n"
+                    msg += f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                
+                # Información de paginación
+                pagina_actual = pagina + 1
+                total_paginas = (total + limite - 1) // limite
+                
+                msg += f"📊 Página {pagina_actual}/{total_paginas}\n"
+                msg += f"📊 Total: {total} tarjetas\n\n"
+                
+                # Botones de navegación
+                keyboard = {"inline_keyboard": []}
+                
+                row = []
+                if pagina > 0:
+                    row.append({"text": "⬅️ Anterior", "callback_data": f"lives_page_{pagina - 1}"})
+                
+                if tiene_mas:
+                    row.append({"text": "Siguiente ➡️", "callback_data": f"lives_page_{pagina + 1}"})
+                
+                if row:
+                    keyboard["inline_keyboard"].append(row)
+                
+                # Botón de recargar
+                keyboard["inline_keyboard"].append([
+                    {"text": "🔄 Recargar", "callback_data": f"lives_page_{pagina}"}
+                ])
+                
+                # Editar mensaje existente
+                try:
+                    requests.post(
+                        f"{API}/editMessageText",
+                        json={
+                            "chat_id": chat_id,
+                            "message_id": message_id,
+                            "text": msg,
+                            "parse_mode": "HTML",
+                            "reply_markup": keyboard
+                        },
+                        timeout=15
+                    )
+                except:
+                    # Si falla editar, enviar nuevo mensaje
+                    send(chat_id, msg, reply_markup=keyboard)
+                
+            except Exception as e:
+                print(f"❌ Error en paginación de lives: {e}")
+                health.record_error("lives_pagination", e)
+            return
+        
+        # Solo admin para approve/reject
+        if chat_id != ADMIN_CHAT_ID:
             return
         
         # ── APPROVE ──
@@ -618,7 +928,7 @@ def handle_callback(callback):
                          f"Usa /login para acceder")
                     
                     send(chat_id,
-                         f"✅ Usuario aprobado\n\n"
+                         f"✅ <b>SOLICITUD APROBADA</b>\n\n"
                          f"Usuario: <code>{req['username']}</code>\n"
                          f"Chat ID: <code>{req_chat_id}</code>")
                     
@@ -628,11 +938,10 @@ def handle_callback(callback):
                     
             except Exception as e:
                 send(chat_id, f"❌ Error: {str(e)}")
-                health.record_error("approve_callback", e)
-            return
-
+                health.record_error("callback_approve", e)
+        
         # ── REJECT ──
-        if data.startswith("reject_"):
+        elif data.startswith("reject_"):
             req_chat_id = data.replace("reject_", "")
             req = get_request(req_chat_id)
             
@@ -646,16 +955,14 @@ def handle_callback(callback):
                  f"Contacta al administrador si crees que es un error.")
             
             send(chat_id,
-                 f"✅ Solicitud rechazada\n\n"
+                 f"❌ <b>SOLICITUD RECHAZADA</b>\n\n"
                  f"Usuario: <code>{req['username']}</code>\n"
                  f"Chat ID: <code>{req_chat_id}</code>")
             
             remove_request(req_chat_id)
-            return
-            
+        
     except Exception as e:
         print(f"❌ Error en callback: {e}")
-        print(traceback.format_exc())
         health.record_error("callback", e)
 
 # ══════════════════════════════════════════════════════════════
@@ -664,16 +971,46 @@ def handle_callback(callback):
 
 app = Flask(__name__)
 
-@app.route("/")
-def index():
-    """Página principal - Panel de estado"""
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Recibe updates de Telegram via webhook"""
+    try:
+        update = request.get_json()
+        health.update_activity()
+        
+        if "message" in update:
+            handle(update["message"])
+        
+        if "callback_query" in update:
+            handle_callback(update["callback_query"])
+            
+        return "OK", 200
+        
+    except Exception as e:
+        print(f"❌ Error webhook: {e}")
+        print(traceback.format_exc())
+        health.record_error("webhook", e)
+        return "ERROR", 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check para Koyeb"""
+    try:
+        stats = health.get_stats()
+        return jsonify(stats), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/', methods=['GET'])
+def home():
+    """Dashboard HTML"""
     try:
         stats = health.get_stats()
         sys_info = get_system_info()
         
         html = f"""
 <!DOCTYPE html>
-<html lang="es">
+<html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -689,17 +1026,19 @@ def index():
             font-family: 'Courier New', monospace;
             background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 100%);
             color: #00ff41;
-            min-height: 100vh;
             padding: 20px;
+            min-height: 100vh;
         }}
         .container {{
-            max-width: 1200px;
+            max-width: 900px;
             margin: 0 auto;
         }}
         .header {{
             text-align: center;
-            padding: 40px 20px;
-            background: rgba(0, 0, 0, 0.5);
+            margin-bottom: 30px;
+            padding: 30px;
+            background: rgba(0, 255, 65, 0.05);
+            border: 2px solid #00ff41;
             border-radius: 15px;
             box-shadow: 0 0 30px rgba(0, 255, 65, 0.3);
         }}
@@ -852,38 +1191,6 @@ def index():
         
     except Exception as e:
         return f"Error: {str(e)}", 500
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    """Endpoint webhook de Telegram"""
-    try:
-        health.update_activity()
-        
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({"status": "error", "message": "No data"}), 400
-        
-        # Manejar mensajes
-        if "message" in data:
-            handle(data["message"])
-        
-        # Manejar callbacks
-        elif "callback_query" in data:
-            handle_callback(data["callback_query"])
-        
-        return jsonify({"status": "ok"}), 200
-        
-    except Exception as e:
-        print(f"❌ Error en webhook: {e}")
-        print(traceback.format_exc())
-        health.record_error("webhook", e)
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route("/health")
-def health_check():
-    """Endpoint de salud"""
-    return jsonify(health.get_stats()), 200
 
 # ══════════════════════════════════════════════════════════════
 # SETUP WEBHOOK
