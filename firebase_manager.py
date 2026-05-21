@@ -1,606 +1,983 @@
 """
 ═══════════════════════════════════════════════════════════════
-FIREBASE MANAGER — ANUBIS CHK (PRO MAX)
+ANUBIS CHK BOT — WEBHOOK VERSION (KOYEB OPTIMIZED)
+═══════════════════════════════════════════════════════════════
+Bot de Telegram con webhooks + Flask
+Optimizado para Koyeb - NO SE DUERME
 ═══════════════════════════════════════════════════════════════
 """
-
 import os
-import json
+import sys
 import time
-import hashlib
-import random
-import string
-import firebase_admin
-from firebase_admin import credentials, firestore
+import json
+import requests
+import traceback
+from threading import Lock
 from datetime import datetime
+from collections import deque
+from flask import Flask, request, jsonify
+
+_BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _BASE)
+
+from firebase_manager import (
+    registrar_usuario,
+    verificar_login,
+    obtener_todos_usuarios,
+    stats_globales,
+    bloquear_usuario,
+    desbloquear_usuario,
+    eliminar_usuario,
+    cambiar_password,
+    obtener_logs_recientes,
+    get_system_info,
+    get_db,  # ✅ ESTO ES LO QUE FALTABA - IMPORTAR get_db()
+    TELEGRAM_TOKEN,
+    ADMIN_CHAT_ID,
+    CREATOR_USERNAME,
+    
+)
+
+API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # ══════════════════════════════════════════════════════════════
-# CONFIG
+# SISTEMA DE SOLICITUDES
 # ══════════════════════════════════════════════════════════════
 
-def _cargar_config():
-    token = os.environ.get("TELEGRAM_TOKEN")
-    admin_id = os.environ.get("ADMIN_CHAT_ID", "7448403516")
-    creator_username = os.environ.get("CREATOR_USERNAME", "ProChekCc")
-    firebase_creds = os.environ.get("FIREBASE_CREDENTIALS")
+pending_requests = {}  # {chat_id: {"username": "xxx", "password": "xxx", "timestamp": xxx}}
+request_lock = Lock()
 
-    # Si hay variables de entorno, usarlas
-    if token and firebase_creds:
+def add_request(chat_id, username, password):
+    """Agregar solicitud de acceso"""
+    with request_lock:
+        pending_requests[chat_id] = {
+            "username": username,
+            "password": password,
+            "timestamp": time.time(),
+        }
+
+def get_request(chat_id):
+    """Obtener solicitud por chat_id"""
+    with request_lock:
+        return pending_requests.get(chat_id)
+
+def remove_request(chat_id):
+    """Eliminar solicitud"""
+    with request_lock:
+        if chat_id in pending_requests:
+            del pending_requests[chat_id]
+
+def get_all_requests():
+    """Obtener todas las solicitudes pendientes"""
+    with request_lock:
+        return dict(pending_requests)
+
+# ══════════════════════════════════════════════════════════════
+# SISTEMA DE SALUD
+# ══════════════════════════════════════════════════════════════
+
+class HealthMonitor:
+    def __init__(self):
+        self.start_time = time.time()
+        self.last_update = time.time()
+        self.errors = deque(maxlen=100)
+        self.error_lock = Lock()
+        self.request_count = 0
+        self.webhook_count = 0
+        
+    def record_error(self, error_type, details):
+        with self.error_lock:
+            self.errors.append({
+                "type": error_type,
+                "details": str(details),
+                "timestamp": time.time()
+            })
+            
+    def get_recent_errors(self, window=300):
+        now = time.time()
+        with self.error_lock:
+            return [e for e in self.errors if now - e["timestamp"] < window]
+    
+    def update_activity(self):
+        self.last_update = time.time()
+        self.webhook_count += 1
+        
+    def get_stats(self):
+        uptime = int(time.time() - self.start_time)
+        return {
+            "status": "healthy",
+            "uptime": uptime,
+            "uptime_formatted": f"{uptime//3600}h {(uptime%3600)//60}m {uptime%60}s",
+            "requests": self.request_count,
+            "webhooks_received": self.webhook_count,
+            "errors_5min": len(self.get_recent_errors(300)),
+            "errors_15min": len(self.get_recent_errors(900)),
+            "last_activity": int(time.time() - self.last_update),
+        }
+
+health = HealthMonitor()
+
+# ══════════════════════════════════════════════════════════════
+# TELEGRAM API
+# ══════════════════════════════════════════════════════════════
+
+def send(chat_id, text, reply_markup=None, parse_mode="HTML"):
+    """Envía mensaje de Telegram"""
+    try:
+        health.request_count += 1
+        
+        data = {
+            "chat_id": chat_id,
+            "text": text[:4096],
+            "parse_mode": parse_mode
+        }
+        
+        if reply_markup:
+            data["reply_markup"] = json.dumps(reply_markup)
+        
+        r = requests.post(
+            f"{API}/sendMessage",
+            json=data,
+            timeout=15
+        )
+        
+        return r.status_code == 200
+        
+    except Exception as e:
+        print(f"⚠️ Error send: {e}")
+        health.record_error("send", e)
+        return False
+
+# ══════════════════════════════════════════════════════════════
+# HANDLERS
+# ══════════════════════════════════════════════════════════════
+
+def handle(msg):
+    """Procesa mensajes"""
+    try:
+        chat_id = str(msg["chat"]["id"])
+        text = msg.get("text", "").strip()
+        telegram_user = msg.get("from", {}).get("username", "desconocido")
+        
+        if not text:
+            return
+
+        # ── ADMIN CHECK ──
+        is_admin = chat_id == ADMIN_CHAT_ID
+
+        # ── START ──
+        if text == "/start":
+            send(chat_id,
+                 f"👋 Bienvenido a <b>ANUBIS CHK</b>\n\n"
+                 f"🔐 Para solicitar acceso usa:\n"
+                 f"<code>/register [usuario] [contraseña]</code>\n\n"
+                 f"Si ya tienes cuenta usa:\n"
+                 f"<code>/login [usuario] [contraseña]</code>\n\n"
+                 f"Creator: @{CREATOR_USERNAME}")
+            return
+
+        # ── REGISTER (SOLICITUD DE ACCESO) ──
+        if text.startswith("/register"):
+            parts = text.split()
+            if len(parts) != 3:
+                send(chat_id,
+                     "❌ Uso correcto:\n"
+                     "<code>/register [usuario] [contraseña]</code>\n\n"
+                     "Ejemplo: <code>/register juan123 mipass456</code>")
+                return
+            
+            username = parts[1]
+            password = parts[2]
+            
+            # Guardar solicitud
+            add_request(chat_id, username, password)
+            
+            # Notificar al usuario
+            send(chat_id,
+                 f"✅ <b>Solicitud enviada</b>\n\n"
+                 f"Usuario: <code>{username}</code>\n"
+                 f"Contraseña: <code>{password}</code>\n\n"
+                 f"⏳ Espera la aprobación del administrador.")
+            
+            # Notificar al admin con botones
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "✅ Aprobar", "callback_data": f"approve_{chat_id}"},
+                        {"text": "❌ Rechazar", "callback_data": f"reject_{chat_id}"}
+                    ]
+                ]
+            }
+            
+            send(ADMIN_CHAT_ID,
+                 f"🔔 <b>NUEVA SOLICITUD DE ACCESO</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                 f"👤 Telegram: @{telegram_user}\n"
+                 f"🆔 Chat ID: <code>{chat_id}</code>\n"
+                 f"📝 Usuario: <code>{username}</code>\n"
+                 f"🔑 Contraseña: <code>{password}</code>",
+                 reply_markup=keyboard)
+            return
+
+        # ── LOGIN ──
+        if text.startswith("/login"):
+            parts = text.split()
+            if len(parts) != 3:
+                send(chat_id,
+                     "❌ Uso correcto:\n"
+                     "<code>/login [usuario] [contraseña]</code>")
+                return
+            
+            user, passwd = parts[1], parts[2]
+            res = verificar_login(user, passwd)
+            
+            if res["ok"]:
+                send(chat_id,
+                     f"✅ Login exitoso\n\n"
+                     f"Usuario: <b>{user}</b>\n"
+                     f"Lives: <b>{res['data'].get('lives_count', 0)}</b>")
+            else:
+                send(chat_id, f"❌ {res['error']}")
+            return
+
+        # ── ADMIN ONLY ──
+        if not is_admin:
+            return
+
+        # ── PANEL ──
+        if text == "/panel":
+            stats = stats_globales()
+            pending_count = len(get_all_requests())
+            
+            msg_text = (
+                f"🎛 <b>PANEL DE ADMINISTRACIÓN</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"👥 Total usuarios: <b>{stats['total']}</b>\n"
+                f"✅ Activos: <b>{stats['activos']}</b>\n"
+                f"💤 Inactivos: <b>{stats['inactivos']}</b>\n"
+                f"🚫 Bloqueados: <b>{stats['bloqueados']}</b>\n"
+                f"💳 Lives totales: <b>{stats['lives']}</b>\n"
+                f"📨 Solicitudes pendientes: <b>{pending_count}</b>\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>COMANDOS</b>\n\n"
+                f"<b>Usuarios:</b>\n"
+                f"/requests — Ver solicitudes pendientes\n"
+                f"/users — Ver usuarios\n"
+                f"/adduser [user] [pass] — Crear usuario\n"
+                f"/block [user] — Bloquear\n"
+                f"/unblock [user] — Desbloquear\n"
+                f"/delete [user] — Eliminar\n"
+                f"/resetpass [user] [pass] — Cambiar contraseña\n\n"
+                f"<b>Lives:</b>\n"
+                f"/lives — Ver todas las lives\n"
+                f"/setmod [live] [moderador] — Asignar moderador\n\n"
+                f"<b>Sistema:</b>\n"
+                f"/logs — Ver logs"
+            )
+            
+            send(chat_id, msg_text)
+            return
+
+        # ── REQUESTS ──
+        if text == "/requests":
+            requests_dict = get_all_requests()
+            
+            if not requests_dict:
+                send(chat_id, "✅ No hay solicitudes pendientes")
+                return
+            
+            msg = "📨 <b>SOLICITUDES PENDIENTES</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            
+            for cid, req in requests_dict.items():
+                msg += (f"👤 Chat ID: <code>{cid}</code>\n"
+                       f"📝 Usuario: <code>{req['username']}</code>\n"
+                       f"🔑 Contraseña: <code>{req['password']}</code>\n"
+                       f"⏰ Hace: {int(time.time() - req['timestamp'])}s\n\n")
+            
+            msg += "\n💡 Usa los botones de las notificaciones o:\n"
+            msg += "<code>/approve [chat_id]</code>\n"
+            msg += "<code>/reject [chat_id]</code>"
+            
+            send(chat_id, msg)
+            return
+
+        # ── APPROVE ──
+        if text.startswith("/approve"):
+            parts = text.split()
+            if len(parts) != 2:
+                send(chat_id, "❌ Uso: /approve [chat_id]")
+                return
+            
+            req_chat_id = parts[1]
+            req = get_request(req_chat_id)
+            
+            if not req:
+                send(chat_id, "❌ No hay solicitud para ese chat_id")
+                return
+            
+            try:
+                res = registrar_usuario(req['username'], req['password'], "0")
+                
+                if res["ok"]:
+                    send(req_chat_id,
+                         f"🎉 <b>¡ACCESO APROBADO!</b>\n\n"
+                         f"Tu cuenta ha sido activada:\n"
+                         f"Usuario: <code>{req['username']}</code>\n"
+                         f"Contraseña: <code>{req['password']}</code>\n\n"
+                         f"Usa /login para acceder")
+                    
+                    send(chat_id,
+                         f"✅ Usuario creado y aprobado\n\n"
+                         f"Usuario: <code>{req['username']}</code>\n"
+                         f"Chat ID: <code>{req_chat_id}</code>")
+                    
+                    remove_request(req_chat_id)
+                else:
+                    send(chat_id, f"❌ Error: {res['error']}")
+                    
+            except Exception as e:
+                send(chat_id, f"❌ Error: {str(e)}")
+                health.record_error("approve_command", e)
+            return
+
+        # ── REJECT ──
+        if text.startswith("/reject"):
+            parts = text.split()
+            if len(parts) != 2:
+                send(chat_id, "❌ Uso: /reject [chat_id]")
+                return
+            
+            req_chat_id = parts[1]
+            req = get_request(req_chat_id)
+            
+            if not req:
+                send(chat_id, "❌ No hay solicitud para ese chat_id")
+                return
+            
+            send(req_chat_id,
+                 f"❌ <b>Solicitud rechazada</b>\n\n"
+                 f"Tu solicitud de acceso ha sido rechazada.\n"
+                 f"Contacta al administrador si crees que es un error.")
+            
+            send(chat_id,
+                 f"✅ Solicitud rechazada\n\n"
+                 f"Usuario: <code>{req['username']}</code>\n"
+                 f"Chat ID: <code>{req_chat_id}</code>")
+            
+            remove_request(req_chat_id)
+            return
+
+        # ── USERS ──
+        if text == "/users":
+            users = obtener_todos_usuarios()
+            
+            if not users:
+                send(chat_id, "❌ No hay usuarios registrados")
+                return
+            
+            msg = "👥 <b>USUARIOS REGISTRADOS</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            
+            for user in users:
+                username = user.get('username', 'N/A')
+                lives = user.get('lives_count', 0)
+                activo = "✅" if user.get('activo') else "💤"
+                bloqueado = "🚫" if user.get('bloqueado') else ""
+                
+                msg += f"{activo}{bloqueado} <b>{username}</b> — {lives} lives\n"
+            
+            send(chat_id, msg)
+            return
+
+        # ── ADD USER ──
+        if text.startswith("/adduser"):
+            parts = text.split()
+            
+            if len(parts) == 2:
+                from firebase_manager import _generar_password
+                user = parts[1]
+                p = _generar_password()
+            elif len(parts) == 3:
+                user, p = parts[1], parts[2]
+            else:
+                send(chat_id,
+                     "❌ Uso:\n"
+                     "<code>/adduser [usuario]</code> (contraseña auto)\n"
+                     "<code>/adduser [usuario] [contraseña]</code>")
+                return
+            
+            res = registrar_usuario(user, p, "0")
+            
+            if res["ok"]:
+                send(chat_id,
+                     f"✅ Usuario creado\n\n"
+                     f"Usuario: <code>{user}</code>\n"
+                     f"Contraseña: <code>{p}</code>")
+            else:
+                send(chat_id, f"❌ {res['error']}")
+            return
+
+        # ── BLOCK ──
+        if text.startswith("/block"):
+            parts = text.split()
+            if len(parts) != 2:
+                send(chat_id, "❌ Uso: /block [usuario]")
+                return
+            
+            user = parts[1]
+            if bloquear_usuario(user):
+                send(chat_id, f"✅ Usuario <code>{user}</code> bloqueado")
+            else:
+                send(chat_id, f"❌ Error bloqueando <code>{user}</code>")
+            return
+
+        # ── UNBLOCK ──
+        if text.startswith("/unblock"):
+            parts = text.split()
+            if len(parts) != 2:
+                send(chat_id, "❌ Uso: /unblock [usuario]")
+                return
+            
+            user = parts[1]
+            if desbloquear_usuario(user):
+                send(chat_id, f"✅ Usuario <code>{user}</code> desbloqueado")
+            else:
+                send(chat_id, f"❌ Error desbloqueando <code>{user}</code>")
+            return
+
+        # ── DELETE ──
+        if text.startswith("/delete"):
+            parts = text.split()
+            if len(parts) != 2:
+                send(chat_id, "❌ Uso: /delete [usuario]")
+                return
+            
+            user = parts[1]
+            if eliminar_usuario(user):
+                send(chat_id, f"✅ Usuario <code>{user}</code> eliminado")
+            else:
+                send(chat_id, f"❌ Error eliminando <code>{user}</code>")
+            return
+
+        # ── RESET PASSWORD ──
+        if text.startswith("/resetpass"):
+            parts = text.split()
+            if len(parts) != 3:
+                send(chat_id,
+                     "❌ Uso:\n"
+                     "<code>/resetpass [usuario] [nueva_contraseña]</code>")
+                return
+            
+            user = parts[1]
+            new_pass = parts[2]
+            
+            if cambiar_password(user, new_pass):
+                send(chat_id,
+                     f"✅ Contraseña cambiada\n\n"
+                     f"Usuario: <code>{user}</code>\n"
+                     f"Nueva contraseña: <code>{new_pass}</code>")
+            else:
+                send(chat_id, f"❌ Error cambiando contraseña de <code>{user}</code>")
+            return
+
+        # ── LOGS ──
+        if text == "/logs":
+            logs = obtener_logs_recientes(15)
+            
+            if not logs:
+                send(chat_id, "❌ No hay logs disponibles")
+                return
+            
+            msg = "📋 <b>LOGS RECIENTES</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            
+            for log in logs:
+                tipo = log.get('tipo', 'N/A')
+                data = log.get('data', 'N/A')
+                msg += f"• <b>{tipo}</b>: {data}\n"
+            
+            send(chat_id, msg)
+            return
+
+        # ── LIVES ──
+        if text == "/lives":
+            try:
+                # ✅ CORREGIDO: Usar get_db() en lugar de db directamente
+                db = get_db()
+                
+                # Obtener la colección lives -> subcoleción anon
+                lives_ref = db.collection('lives').document('anon').collection('tarjetas')
+                lives_docs = lives_ref.stream()
+                
+                lives_list = []
+                for doc in lives_docs:
+                    live_data = doc.to_dict()
+                    live_data['id'] = doc.id
+                    lives_list.append(live_data)
+                
+                if not lives_list:
+                    send(chat_id, "❌ No hay lives disponibles")
+                    return
+                
+                msg = "📺 <b>LIVES DISPONIBLES</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                
+                for live in lives_list[:10]:  # Mostrar solo las primeras 10
+                    live_id = live.get('id', 'N/A')
+                    
+                    msg += f"💳 <code>{live_id}</code>\n"
+                
+                msg += f"\n📊 Total: <b>{len(lives_list)}</b> tarjetas\n"
+                
+                send(chat_id, msg)
+                
+            except Exception as e:
+                send(chat_id, f"❌ Error obteniendo lives: {str(e)}")
+                health.record_error("lives_command", e)
+                print(f"❌ Error detallado en /lives: {traceback.format_exc()}")
+            return
+
+        # ── SET MODERATOR ──
+        if text.startswith("/setmod"):
+            parts = text.split()
+            if len(parts) != 3:
+                send(chat_id,
+                     "❌ Uso: /setmod [nombre_live] [usuario_moderador]\n\n"
+                     "Ejemplo: <code>/setmod live1 juan_mod</code>")
+                return
+            
+            live_name = parts[1]
+            moderador = parts[2]
+            
+            try:
+                # ✅ CORREGIDO: Usar get_db() en lugar de db directamente
+                db = get_db()
+                
+                # Actualizar el moderador en Firebase
+                live_ref = db.collection('lives').document('anon').collection('tarjetas').document(live_name)
+                
+                # Verificar si la live existe
+                live_doc = live_ref.get()
+                
+                if not live_doc.exists:
+                    send(chat_id, f"❌ La live <code>{live_name}</code> no existe")
+                    return
+                
+                # Actualizar el moderador
+                live_ref.update({
+                    'moderador': moderador
+                })
+                
+                send(chat_id,
+                     f"✅ <b>Moderador asignado</b>\n\n"
+                     f"📺 Live: <code>{live_name}</code>\n"
+                     f"👤 Moderador: <code>{moderador}</code>")
+                
+            except Exception as e:
+                send(chat_id, f"❌ Error asignando moderador: {str(e)}")
+                health.record_error("setmod_command", e)
+                print(f"❌ Error detallado en /setmod: {traceback.format_exc()}")
+            return
+
+    except Exception as e:
+        print(f"❌ Error en handler: {e}")
+        print(traceback.format_exc())
+        health.record_error("handler", e)
+        
         try:
-            creds_dict = json.loads(firebase_creds)
-            return token, str(admin_id), creator_username, creds_dict
+            chat_id = str(msg["chat"]["id"])
+            send(chat_id, "❌ Ocurrió un error. Intenta nuevamente.")
         except:
             pass
 
-    # Intentar cargar desde archivos
+def handle_callback(callback):
+    """Maneja callbacks de botones inline"""
     try:
-        _BASE = os.path.dirname(os.path.abspath(__file__))
+        data = callback.get("data", "")
+        message = callback.get("message", {})
+        chat_id = str(message.get("chat", {}).get("id", ""))
         
-        # Cargar config.json
-        config_file = os.path.join(_BASE, "config.json")
-        if os.path.exists(config_file):
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                token = config.get("telegram_token", token)
-                admin_id = config.get("admin_chat_id", admin_id)
+        if not chat_id or chat_id != ADMIN_CHAT_ID:
+            return
         
-        # Cargar firebase-credentials.json
-        cred_file = os.path.join(_BASE, "firebase-credentials.json")
-        if os.path.exists(cred_file):
-            with open(cred_file, 'r', encoding='utf-8') as f:
-                firebase_creds = json.load(f)
-        
-        if token and firebase_creds:
-            return token, str(admin_id), creator_username, firebase_creds
+        # ── APPROVE ──
+        if data.startswith("approve_"):
+            req_chat_id = data.replace("approve_", "")
+            req = get_request(req_chat_id)
+            
+            if not req:
+                send(chat_id, "❌ Solicitud ya procesada o no existe")
+                return
+            
+            try:
+                res = registrar_usuario(req['username'], req['password'], "0")
+                
+                if res["ok"]:
+                    send(req_chat_id,
+                         f"🎉 <b>¡ACCESO APROBADO!</b>\n\n"
+                         f"Tu cuenta ha sido activada:\n"
+                         f"Usuario: <code>{req['username']}</code>\n"
+                         f"Contraseña: <code>{req['password']}</code>\n\n"
+                         f"Usa /login para acceder")
+                    
+                    send(chat_id,
+                         f"✅ Usuario aprobado\n\n"
+                         f"Usuario: <code>{req['username']}</code>\n"
+                         f"Chat ID: <code>{req_chat_id}</code>")
+                    
+                    remove_request(req_chat_id)
+                else:
+                    send(chat_id, f"❌ Error: {res['error']}")
+                    
+            except Exception as e:
+                send(chat_id, f"❌ Error: {str(e)}")
+                health.record_error("approve_callback", e)
+            return
+
+        # ── REJECT ──
+        if data.startswith("reject_"):
+            req_chat_id = data.replace("reject_", "")
+            req = get_request(req_chat_id)
+            
+            if not req:
+                send(chat_id, "❌ Solicitud ya procesada o no existe")
+                return
+            
+            send(req_chat_id,
+                 f"❌ <b>Solicitud rechazada</b>\n\n"
+                 f"Tu solicitud de acceso ha sido rechazada.\n"
+                 f"Contacta al administrador si crees que es un error.")
+            
+            send(chat_id,
+                 f"✅ Solicitud rechazada\n\n"
+                 f"Usuario: <code>{req['username']}</code>\n"
+                 f"Chat ID: <code>{req_chat_id}</code>")
+            
+            remove_request(req_chat_id)
+            return
             
     except Exception as e:
-        print(f"⚠️ Error cargando config: {e}")
+        print(f"❌ Error en callback: {e}")
+        print(traceback.format_exc())
+        health.record_error("callback", e)
+
+# ══════════════════════════════════════════════════════════════
+# FLASK APP
+# ══════════════════════════════════════════════════════════════
+
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    """Página principal - Panel de estado"""
+    try:
+        stats = health.get_stats()
+        sys_info = get_system_info()
+        
+        html = f"""
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="30">
+    <title>𓂀 ANUBIS CHK</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        body {{
+            font-family: 'Courier New', monospace;
+            background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 100%);
+            color: #00ff41;
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+        }}
+        .header {{
+            text-align: center;
+            padding: 40px 20px;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 15px;
+            box-shadow: 0 0 30px rgba(0, 255, 65, 0.3);
+        }}
+        h1 {{
+            font-size: 48px;
+            margin-bottom: 10px;
+            text-shadow: 0 0 20px rgba(0, 255, 65, 0.5);
+        }}
+        .subtitle {{
+            color: #888;
+            font-size: 14px;
+        }}
+        .badge {{
+            display: inline-block;
+            padding: 5px 15px;
+            margin: 5px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: bold;
+            background: rgba(0, 255, 65, 0.2);
+            color: #00ff41;
+        }}
+        .grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }}
+        .card {{
+            background: rgba(26, 26, 46, 0.8);
+            border: 2px solid #00ff41;
+            border-radius: 10px;
+            padding: 25px;
+            backdrop-filter: blur(10px);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }}
+        .card:hover {{
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0, 255, 65, 0.4);
+        }}
+        .card-title {{
+            font-size: 20px;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #00ff41;
+            color: #00ff41;
+        }}
+        .stat {{
+            display: flex;
+            justify-content: space-between;
+            margin: 10px 0;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(0, 255, 65, 0.1);
+        }}
+        .stat-label {{
+            color: #888;
+        }}
+        .stat-value {{
+            color: #00ff41;
+            font-weight: bold;
+        }}
+        .footer {{
+            text-align: center;
+            margin-top: 30px;
+            padding: 20px;
+            color: #555;
+            font-size: 12px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>𓂀 ANUBIS CHK</h1>
+            <p class="subtitle">Sistema de Gestión de Usuarios</p>
+            <div style="margin-top: 15px;">
+                <span class="badge">✅ WEBHOOK MODE</span>
+                <span class="badge">🚀 KOYEB OPTIMIZED</span>
+                <span class="badge">⚡ NO SLEEP</span>
+            </div>
+        </div>
+        
+        <div class="grid">
+            <div class="card">
+                <div class="card-title">🏥 Estado del Sistema</div>
+                <div class="stat">
+                    <span class="stat-label">Status:</span>
+                    <span class="stat-value">{stats['status'].upper()}</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Uptime:</span>
+                    <span class="stat-value">{stats['uptime_formatted']}</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Última actividad:</span>
+                    <span class="stat-value">{stats['last_activity']}s</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <div class="card-title">📊 Métricas</div>
+                <div class="stat">
+                    <span class="stat-label">Requests:</span>
+                    <span class="stat-value">{stats['requests']}</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Webhooks recibidos:</span>
+                    <span class="stat-value">{stats['webhooks_received']}</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Errores (5min):</span>
+                    <span class="stat-value">{stats['errors_5min']}</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Errores (15min):</span>
+                    <span class="stat-value">{stats['errors_15min']}</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <div class="card-title">⚙️ Configuración</div>
+                <div class="stat">
+                    <span class="stat-label">Admin ID:</span>
+                    <span class="stat-value">{sys_info['admin_id']}</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Creator:</span>
+                    <span class="stat-value">@{sys_info['creator']}</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Versión:</span>
+                    <span class="stat-value">{sys_info['version']}</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Mode:</span>
+                    <span class="stat-value">WEBHOOK</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="footer">
+            © 2025 ANUBIS CHK — Desarrollado por @{sys_info['creator']}<br>
+            Auto-refresh cada 30s
+        </div>
+    </div>
+</body>
+</html>
+        """
+        return html
+        
+    except Exception as e:
+        return f"Error: {str(e)}", 500
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """Endpoint webhook de Telegram"""
+    try:
+        health.update_activity()
+        
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"status": "error", "message": "No data"}), 400
+        
+        # Manejar mensajes
+        if "message" in data:
+            handle(data["message"])
+        
+        # Manejar callbacks
+        elif "callback_query" in data:
+            handle_callback(data["callback_query"])
+        
+        return jsonify({"status": "ok"}), 200
+        
+    except Exception as e:
+        print(f"❌ Error en webhook: {e}")
+        print(traceback.format_exc())
+        health.record_error("webhook", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/health")
+def health_check():
+    """Endpoint de salud"""
+    return jsonify(health.get_stats()), 200
+
+# ══════════════════════════════════════════════════════════════
+# SETUP WEBHOOK
+# ══════════════════════════════════════════════════════════════
+
+def setup_webhook():
+    """Configura el webhook de Telegram"""
     
-    raise RuntimeError("❌ Configuración faltante - verifica TELEGRAM_TOKEN y credenciales de Firebase")
-
-
-TELEGRAM_TOKEN, ADMIN_CHAT_ID, CREATOR_USERNAME, FIREBASE_CREDS = _cargar_config()
-
-print(f"✅ Config cargada - Admin ID: {ADMIN_CHAT_ID}")
-print(f"✅ Creator: @{CREATOR_USERNAME}")
-
-# ══════════════════════════════════════════════════════════════
-# FIREBASE INIT
-# ══════════════════════════════════════════════════════════════
-
-_db = None
-
-def get_db():
-    global _db
-    if _db:
-        return _db
-
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(FIREBASE_CREDS)
-        firebase_admin.initialize_app(cred)
-
-    _db = firestore.client()
-    print("✅ Firebase listo")
-    return _db
-
-# ══════════════════════════════════════════════════════════════
-# CACHE + RATE LIMIT
-# ══════════════════════════════════════════════════════════════
-
-_cache = {}
-_rate_limit = {}
-
-def rate_limit(chat_id, limite=5, ventana=10):
-    ahora = time.time()
-
-    if chat_id not in _rate_limit:
-        _rate_limit[chat_id] = []
-
-    _rate_limit[chat_id] = [
-        t for t in _rate_limit[chat_id]
-        if ahora - t < ventana
-    ]
-
-    if len(_rate_limit[chat_id]) >= limite:
+    # Obtener URL pública de Koyeb
+    webhook_url = os.environ.get("KOYEB_PUBLIC_URL", "")
+    
+    if not webhook_url:
+        print("⚠️ KOYEB_PUBLIC_URL no encontrada en variables de entorno")
+        print("⚠️ El bot NO funcionará hasta que configures el webhook manualmente")
         return False
-
-    _rate_limit[chat_id].append(ahora)
-    return True
-
-# ══════════════════════════════════════════════════════════════
-# UTILIDADES
-# ══════════════════════════════════════════════════════════════
-
-def _hash(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def _generar_password(longitud=8):
-    """Genera una contraseña aleatoria"""
-    caracteres = string.ascii_letters + string.digits
-    return ''.join(random.choice(caracteres) for _ in range(longitud))
-
-def log_evento(tipo, data):
+    
+    # Añadir ruta del webhook
+    if not webhook_url.endswith("/"):
+        webhook_url += "/"
+    webhook_url += "webhook"
+    
+    print(f"🔧 Configurando webhook: {webhook_url}")
+    
     try:
-        db = get_db()
-        db.collection("logs").add({
-            "tipo": tipo,
-            "data": data,
-            "timestamp": firestore.SERVER_TIMESTAMP
-        })
-    except:
-        pass
-
-def get_system_info():
-    """Obtiene información del sistema"""
-    try:
-        import psutil
+        # Eliminar webhook anterior (si existe)
+        requests.post(
+            f"{API}/deleteWebhook",
+            timeout=10
+        )
         
-        return {
-            "cpu_percent": psutil.cpu_percent(interval=1),
-            "memory_percent": psutil.virtual_memory().percent,
-            "disk_percent": psutil.disk_usage('/').percent,
-            "boot_time": datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S"),
-            "firebase_project": FIREBASE_CREDS.get("project_id", "N/A"),
-            "admin_id": ADMIN_CHAT_ID,
-            "creator": CREATOR_USERNAME,
-            "version": "2.0"
-        }
-    except:
-        return {
-            "cpu_percent": 0,
-            "memory_percent": 0,
-            "disk_percent": 0,
-            "boot_time": "N/A",
-            "firebase_project": FIREBASE_CREDS.get("project_id", "N/A"),
-            "admin_id": ADMIN_CHAT_ID,
-            "creator": CREATOR_USERNAME,
-            "version": "2.0"
-        }
-
-# ══════════════════════════════════════════════════════════════
-# USUARIOS
-# ══════════════════════════════════════════════════════════════
-
-def registrar_usuario(username, password, chat_id):
-    try:
-        db = get_db()
-        doc_id = username.lower().strip()
-
-        ref = db.collection("usuarios").document(doc_id)
-
-        if ref.get().exists:
-            return {"ok": False, "error": "Ya existe"}
-
-        ref.set({
-            "username": username,
-            "password_hash": _hash(password),
-            "chat_id": str(chat_id),
-            "lives_count": 0,
-            "activo": True,
-            "bloqueado": False,
-            "intentos_fallidos": 0,
-            "created_at": firestore.SERVER_TIMESTAMP,
-            "last_login": None
-        })
-
-        log_evento("registro", username)
-
-        return {"ok": True}
-
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# ══════════════════════════════════════════════════════════════
-# LOGIN
-# ══════════════════════════════════════════════════════════════
-
-def verificar_login(username, password):
-    try:
-        db = get_db()
-        doc_id = username.lower().strip()
-
-        ref = db.collection("usuarios").document(doc_id)
-        doc = ref.get()
-
-        if not doc.exists:
-            return {"ok": False, "error": "No existe"}
-
-        data = doc.to_dict()
-
-        if data.get("bloqueado"):
-            return {"ok": False, "error": "Usuario bloqueado"}
-
-        if data.get("password_hash") != _hash(password):
-            intentos = data.get("intentos_fallidos", 0) + 1
-
-            ref.update({"intentos_fallidos": intentos})
-
-            if intentos >= 5:
-                ref.update({"bloqueado": True})
-
-            return {"ok": False, "error": "Contraseña incorrecta"}
-
-        # login correcto
-        ref.update({
-            "intentos_fallidos": 0,
-            "last_login": firestore.SERVER_TIMESTAMP
-        })
-
-        log_evento("login", username)
-
-        return {"ok": True, "data": data}
-
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# ══════════════════════════════════════════════════════════════
-# CONSULTAS
-# ══════════════════════════════════════════════════════════════
-def get_usuario_por_chat(chat_id):
-    try:
-        db = get_db()
-        docs = db.collection("usuarios").where("chat_id", "==", str(chat_id)).stream()
-
-        for doc in docs:
-            return doc.to_dict()
-
-        return None
-    except:
-        return None
-
-def obtener_usuario(username):
-    if username in _cache:
-        return _cache[username]
-
-    try:
-        db = get_db()
-        doc = db.collection("usuarios").document(username.lower()).get()
-
-        if not doc.exists:
-            return None
-
-        data = doc.to_dict()
-        _cache[username] = data
-        return data
-
-    except:
-        return None
-
-
-def obtener_todos_usuarios():
-    """Obtener todos los usuarios con verificación de datos"""
-    try:
-        db = get_db()
-        users = []
+        time.sleep(1)
         
-        # Obtener todos los documentos de la colección usuarios
-        docs = db.collection("usuarios").stream()
+        # Configurar nuevo webhook
+        r = requests.post(
+            f"{API}/setWebhook",
+            json={"url": webhook_url},
+            timeout=10
+        )
         
-        for doc in docs:
-            data = doc.to_dict()
-            
-            # Verificar que el documento tenga los campos necesarios
-            if data:
-                # Asegurarse de que el ID del documento también se incluya
-                data['doc_id'] = doc.id
+        if r.status_code == 200:
+            result = r.json()
+            if result.get("ok"):
+                print(f"✅ Webhook configurado exitosamente")
+                print(f"✅ URL: {webhook_url}")
                 
-                # Convertir chat_id a string si es necesario
-                if 'chat_id' in data and data['chat_id']:
-                    data['chat_id'] = str(data['chat_id'])
-                
-                # Asegurar que username exista
-                if 'username' not in data:
-                    data['username'] = doc.id
-                
-                users.append(data)
-                print(f"✅ Usuario encontrado: {data.get('username', 'N/A')}")
-        
-        print(f"📊 Total de usuarios encontrados: {len(users)}")
-        return users
-        
-    except Exception as e:
-        print(f"❌ Error obteniendo usuarios: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
-
-# ══════════════════════════════════════════════════════════════
-# STATS
-# ══════════════════════════════════════════════════════════════
-
-def actualizar_lives(username, cantidad=1):
-    try:
-        db = get_db()
-        db.collection("usuarios").document(username.lower()).update({
-            "lives_count": firestore.Increment(cantidad)
-        })
-
-        log_evento("lives_update", username)
-        return True
-    except:
-        return False
-
-# ══════════════════════════════════════════════════════════════
-# ADMIN
-# ══════════════════════════════════════════════════════════════
-
-def bloquear_usuario(username):
-    try:
-        db = get_db()
-        db.collection("usuarios").document(username.lower()).update({
-            "bloqueado": True
-        })
-        log_evento("usuario_bloqueado", username)
-        return True
-    except:
-        return False
-
-
-def desbloquear_usuario(username):
-    try:
-        db = get_db()
-        db.collection("usuarios").document(username.lower()).update({
-            "bloqueado": False,
-            "intentos_fallidos": 0
-        })
-        log_evento("usuario_desbloqueado", username)
-        return True
-    except:
-        return False
-
-
-def activar_usuario(username):
-    try:
-        db = get_db()
-        db.collection("usuarios").document(username.lower()).update({
-            "activo": True
-        })
-        log_evento("usuario_activado", username)
-        return True
-    except:
-        return False
-
-
-def desactivar_usuario(username):
-    try:
-        db = get_db()
-        db.collection("usuarios").document(username.lower()).update({
-            "activo": False
-        })
-        log_evento("usuario_desactivado", username)
-        return True
-    except:
-        return False
-
-
-def eliminar_usuario(username):
-    try:
-        db = get_db()
-        db.collection("usuarios").document(username.lower()).delete()
-        log_evento("usuario_eliminado", username)
-        return True
-    except:
-        return False
-
-
-def cambiar_password(username, nueva_password):
-    """Cambia la contraseña de un usuario"""
-    try:
-        db = get_db()
-        doc_id = username.lower().strip()
-        
-        ref = db.collection("usuarios").document(doc_id)
-        doc = ref.get()
-        
-        if not doc.exists:
-            return False
-        
-        ref.update({
-            "password_hash": _hash(nueva_password),
-            "intentos_fallidos": 0,
-            "bloqueado": False
-        })
-        
-        log_evento("password_changed", username)
-        return True
-        
-    except Exception as e:
-        print(f"❌ Error cambiando contraseña: {e}")
-        return False
-
-# ══════════════════════════════════════════════════════════════
-# LOGS
-# ══════════════════════════════════════════════════════════════
-
-def obtener_logs_recientes(limite=20):
-    """Obtiene los logs más recientes"""
-    try:
-        db = get_db()
-        
-        docs = db.collection("logs") \
-            .order_by("timestamp", direction=firestore.Query.DESCENDING) \
-            .limit(limite) \
-            .stream()
-        
-        logs = []
-        for doc in docs:
-            data = doc.to_dict()
-            
-            # Formatear timestamp si existe
-            if 'timestamp' in data and data['timestamp']:
+                # Notificar al admin
                 try:
-                    ts = data['timestamp']
-                    data['timestamp_formatted'] = ts.strftime("%Y-%m-%d %H:%M:%S")
+                    send(ADMIN_CHAT_ID,
+                         "🚀 <b>ANUBIS CHK ONLINE</b>\n\n"
+                         "✅ Modo: <b>WEBHOOK</b>\n"
+                         "✅ Estado: <b>ACTIVO</b>\n"
+                         f"✅ URL: <code>{webhook_url}</code>\n\n"
+                         "Panel de control: /panel\n"
+                         "Solicitudes: /requests")
                 except:
-                    data['timestamp_formatted'] = "N/A"
+                    pass
+                
+                return True
+            else:
+                print(f"❌ Error configurando webhook: {result.get('description')}")
+                return False
+        else:
+            print(f"❌ Error HTTP {r.status_code}: {r.text}")
+            return False
             
-            logs.append(data)
-        
-        return logs
-        
     except Exception as e:
-        print(f"❌ Error obteniendo logs: {e}")
-        return []
-
-# ══════════════════════════════════════════════════════════════
-# MODERADORES
-# ══════════════════════════════════════════════════════════════
-
-def agregar_moderador(chat_id, username=None):
-    """Agregar un moderador"""
-    try:
-        db = get_db()
-        mod_id = str(chat_id)
-        
-        ref = db.collection("moderadores").document(mod_id)
-        ref.set({
-            "chat_id": mod_id,
-            "username": username or "N/A",
-            "agregado_at": firestore.SERVER_TIMESTAMP,
-            "activo": True
-        })
-        
-        log_evento("moderador_agregado", {"chat_id": mod_id, "username": username})
-        return True
-    except Exception as e:
-        print(f"❌ Error agregando moderador: {e}")
+        print(f"❌ Error configurando webhook: {e}")
+        print(traceback.format_exc())
         return False
 
-def eliminar_moderador(chat_id):
-    """Eliminar un moderador"""
-    try:
-        db = get_db()
-        db.collection("moderadores").document(str(chat_id)).delete()
-        log_evento("moderador_eliminado", str(chat_id))
-        return True
-    except:
-        return False
-
-def es_moderador(chat_id):
-    """Verifica si un chat_id es moderador"""
-    try:
-        db = get_db()
-        doc = db.collection("moderadores").document(str(chat_id)).get()
-        if doc.exists:
-            data = doc.to_dict()
-            return data.get("activo", False)
-        return False
-    except:
-        return False
-
-def obtener_moderadores():
-    """Obtiene la lista de moderadores"""
-    try:
-        db = get_db()
-        docs = db.collection("moderadores").where("activo", "==", True).stream()
-        
-        mods = []
-        for doc in docs:
-            data = doc.to_dict()
-            mods.append(data)
-        
-        return mods
-    except Exception as e:
-        print(f"❌ Error obteniendo moderadores: {e}")
-        return []
-
 # ══════════════════════════════════════════════════════════════
-# GESTIÓN DE LIVES
+# ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 
-def agregar_lives(username, cantidad):
-    """Agrega lives a un usuario"""
-    try:
-        db = get_db()
-        ref = db.collection("usuarios").document(username.lower())
-        doc = ref.get()
-        
-        if not doc.exists:
-            return {"ok": False, "error": "Usuario no encontrado"}
-        
-        ref.update({
-            "lives_count": firestore.Increment(cantidad)
-        })
-        
-        log_evento("lives_agregadas", {"username": username, "cantidad": cantidad})
-        return {"ok": True, "mensaje": f"Se agregaron {cantidad} lives a {username}"}
-        
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-def quitar_lives(username, cantidad):
-    """Quita lives a un usuario"""
-    try:
-        db = get_db()
-        ref = db.collection("usuarios").document(username.lower())
-        doc = ref.get()
-        
-        if not doc.exists:
-            return {"ok": False, "error": "Usuario no encontrado"}
-        
-        data = doc.to_dict()
-        lives_actuales = data.get("lives_count", 0)
-        
-        if lives_actuales < cantidad:
-            return {"ok": False, "error": f"El usuario solo tiene {lives_actuales} lives"}
-        
-        ref.update({
-            "lives_count": firestore.Increment(-cantidad)
-        })
-        
-        log_evento("lives_quitadas", {"username": username, "cantidad": cantidad})
-        return {"ok": True, "mensaje": f"Se quitaron {cantidad} lives a {username}"}
-        
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-def establecer_lives(username, cantidad):
-    """Establece un número exacto de lives"""
-    try:
-        db = get_db()
-        ref = db.collection("usuarios").document(username.lower())
-        doc = ref.get()
-        
-        if not doc.exists:
-            return {"ok": False, "error": "Usuario no encontrado"}
-        
-        ref.update({
-            "lives_count": cantidad
-        })
-        
-        log_evento("lives_establecidas", {"username": username, "cantidad": cantidad})
-        return {"ok": True, "mensaje": f"Lives de {username} establecidas a {cantidad}"}
-        
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# ══════════════════════════════════════════════════════════════
-# STATS GLOBALES
-# ══════════════════════════════════════════════════════════════
-
-def stats_globales():
-    try:
-        usuarios = obtener_todos_usuarios()
-
-        total = len(usuarios)
-        activos = sum(1 for u in usuarios if u.get("activo"))
-        inactivos = total - activos
-        bloqueados = sum(1 for u in usuarios if u.get("bloqueado"))
-        lives = sum(u.get("lives_count", 0) for u in usuarios)
-
-        return {
-            "total": total,
-            "activos": activos,
-            "inactivos": inactivos,
-            "bloqueados": bloqueados,
-            "lives": lives
-        }
-
-    except:
-        return {
-            "total": 0,
-            "activos": 0,
-            "inactivos": 0,
-            "bloqueados": 0,
-            "lives": 0
-        }
+if __name__ == "__main__":
+    print("═" * 60)
+    print("🚀 ANUBIS CHK — WEBHOOK MODE")
+    print("═" * 60)
+    print()
+    
+    # Esperar a que Koyeb esté listo
+    time.sleep(3)
+    
+    # Configurar webhook
+    setup_webhook()
+    
+    # Iniciar Flask
+    port = int(os.environ.get("PORT", 8000))
+    print(f"\n🌐 Iniciando Flask en puerto {port}...")
+    print("✅ Bot listo para recibir mensajes\n")
+    
+    app.run(
+        host='0.0.0.0',
+        port=port,
+        debug=False,
+        use_reloader=False
+    )
