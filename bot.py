@@ -31,6 +31,7 @@ from firebase_manager import (
     cambiar_password,
     obtener_logs_recientes,
     get_system_info,
+    get_db,  # ✅ ESTO ES LO QUE FALTABA - IMPORTAR get_db()
     TELEGRAM_TOKEN,
     ADMIN_CHAT_ID,
     CREATOR_USERNAME,
@@ -400,23 +401,19 @@ def handle(msg):
             else:
                 send(chat_id,
                      "❌ Uso:\n"
-                     "<code>/adduser [usuario]</code> (genera contraseña)\n"
+                     "<code>/adduser [usuario]</code> (contraseña auto)\n"
                      "<code>/adduser [usuario] [contraseña]</code>")
                 return
             
-            try:
-                res = registrar_usuario(user, p, "0")
-                
-                if res["ok"]:
-                    send(chat_id,
-                         f"✅ Usuario creado\n\n"
-                         f"Usuario: <code>{user}</code>\n"
-                         f"Contraseña: <code>{p}</code>")
-                else:
-                    send(chat_id, f"❌ Error: {res['error']}")
-            except Exception as e:
-                send(chat_id, f"❌ Error: {str(e)}")
-                health.record_error("adduser_command", e)
+            res = registrar_usuario(user, p, "0")
+            
+            if res["ok"]:
+                send(chat_id,
+                     f"✅ Usuario creado\n\n"
+                     f"Usuario: <code>{user}</code>\n"
+                     f"Contraseña: <code>{p}</code>")
+            else:
+                send(chat_id, f"❌ {res['error']}")
             return
 
         # ── BLOCK ──
@@ -428,9 +425,9 @@ def handle(msg):
             
             user = parts[1]
             if bloquear_usuario(user):
-                send(chat_id, f"✅ Usuario <b>{user}</b> bloqueado")
+                send(chat_id, f"✅ Usuario <code>{user}</code> bloqueado")
             else:
-                send(chat_id, f"❌ Error bloqueando usuario")
+                send(chat_id, f"❌ Error bloqueando <code>{user}</code>")
             return
 
         # ── UNBLOCK ──
@@ -442,9 +439,9 @@ def handle(msg):
             
             user = parts[1]
             if desbloquear_usuario(user):
-                send(chat_id, f"✅ Usuario <b>{user}</b> desbloqueado")
+                send(chat_id, f"✅ Usuario <code>{user}</code> desbloqueado")
             else:
-                send(chat_id, f"❌ Error desbloqueando usuario")
+                send(chat_id, f"❌ Error desbloqueando <code>{user}</code>")
             return
 
         # ── DELETE ──
@@ -456,9 +453,9 @@ def handle(msg):
             
             user = parts[1]
             if eliminar_usuario(user):
-                send(chat_id, f"✅ Usuario <b>{user}</b> eliminado")
+                send(chat_id, f"✅ Usuario <code>{user}</code> eliminado")
             else:
-                send(chat_id, f"❌ Error eliminando usuario")
+                send(chat_id, f"❌ Error eliminando <code>{user}</code>")
             return
 
         # ── RESET PASSWORD ──
@@ -466,18 +463,20 @@ def handle(msg):
             parts = text.split()
             if len(parts) != 3:
                 send(chat_id,
-                     "❌ Uso: /resetpass [usuario] [nueva_contraseña]\n\n"
-                     "Ejemplo: <code>/resetpass juan nuevapass123</code>")
+                     "❌ Uso:\n"
+                     "<code>/resetpass [usuario] [nueva_contraseña]</code>")
                 return
             
-            user, new_pass = parts[1], parts[2]
+            user = parts[1]
+            new_pass = parts[2]
+            
             if cambiar_password(user, new_pass):
                 send(chat_id,
-                     f"✅ Contraseña actualizada\n\n"
+                     f"✅ Contraseña cambiada\n\n"
                      f"Usuario: <code>{user}</code>\n"
                      f"Nueva contraseña: <code>{new_pass}</code>")
             else:
-                send(chat_id, f"❌ Error cambiando contraseña")
+                send(chat_id, f"❌ Error cambiando contraseña de <code>{user}</code>")
             return
 
         # ── LOGS ──
@@ -501,8 +500,11 @@ def handle(msg):
         # ── LIVES ──
         if text == "/lives":
             try:
-                # Obtener todas las lives de Firebase
-                lives_ref = db.collection('lives').collection('anon')
+                # ✅ CORREGIDO: Usar get_db() en lugar de db directamente
+                db = get_db()
+                
+                # Obtener la colección lives -> subcoleción anon
+                lives_ref = db.collection('lives').document('anon').collection('tarjetas')
                 lives_docs = lives_ref.stream()
                 
                 lives_list = []
@@ -517,26 +519,19 @@ def handle(msg):
                 
                 msg = "📺 <b>LIVES DISPONIBLES</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 
-                for live in lives_list:
+                for live in lives_list[:10]:  # Mostrar solo las primeras 10
                     live_id = live.get('id', 'N/A')
-                    moderador = live.get('moderador', 'Sin asignar')
-                    tarjetas = live.get('tarjetas', [])
-                    num_tarjetas = len(tarjetas) if isinstance(tarjetas, list) else 0
                     
-                    msg += (f"🎬 <b>{live_id}</b>\n"
-                           f"👤 Moderador: <code>{moderador}</code>\n"
-                           f"💳 Tarjetas: {num_tarjetas}\n"
-                           f"━━━━━━━━━━━━━━━━━━━━━━\n\n")
+                    msg += f"💳 <code>{live_id}</code>\n"
                 
-                msg += "\n💡 Para asignar moderador:\n"
-                msg += "<code>/setmod [nombre_live] [usuario_mod]</code>\n\n"
-                msg += "Ejemplo: <code>/setmod live1 juan_mod</code>"
+                msg += f"\n📊 Total: <b>{len(lives_list)}</b> tarjetas\n"
                 
                 send(chat_id, msg)
                 
             except Exception as e:
                 send(chat_id, f"❌ Error obteniendo lives: {str(e)}")
                 health.record_error("lives_command", e)
+                print(f"❌ Error detallado en /lives: {traceback.format_exc()}")
             return
 
         # ── SET MODERATOR ──
@@ -552,8 +547,11 @@ def handle(msg):
             moderador = parts[2]
             
             try:
+                # ✅ CORREGIDO: Usar get_db() en lugar de db directamente
+                db = get_db()
+                
                 # Actualizar el moderador en Firebase
-                live_ref = db.collection('lives').collection('anon').document(live_name)
+                live_ref = db.collection('lives').document('anon').collection('tarjetas').document(live_name)
                 
                 # Verificar si la live existe
                 live_doc = live_ref.get()
@@ -575,6 +573,7 @@ def handle(msg):
             except Exception as e:
                 send(chat_id, f"❌ Error asignando moderador: {str(e)}")
                 health.record_error("setmod_command", e)
+                print(f"❌ Error detallado en /setmod: {traceback.format_exc()}")
             return
 
     except Exception as e:
@@ -619,7 +618,7 @@ def handle_callback(callback):
                          f"Usa /login para acceder")
                     
                     send(chat_id,
-                         f"✅ <b>SOLICITUD APROBADA</b>\n\n"
+                         f"✅ Usuario aprobado\n\n"
                          f"Usuario: <code>{req['username']}</code>\n"
                          f"Chat ID: <code>{req_chat_id}</code>")
                     
@@ -629,10 +628,11 @@ def handle_callback(callback):
                     
             except Exception as e:
                 send(chat_id, f"❌ Error: {str(e)}")
-                health.record_error("callback_approve", e)
-        
+                health.record_error("approve_callback", e)
+            return
+
         # ── REJECT ──
-        elif data.startswith("reject_"):
+        if data.startswith("reject_"):
             req_chat_id = data.replace("reject_", "")
             req = get_request(req_chat_id)
             
@@ -646,14 +646,16 @@ def handle_callback(callback):
                  f"Contacta al administrador si crees que es un error.")
             
             send(chat_id,
-                 f"❌ <b>SOLICITUD RECHAZADA</b>\n\n"
+                 f"✅ Solicitud rechazada\n\n"
                  f"Usuario: <code>{req['username']}</code>\n"
                  f"Chat ID: <code>{req_chat_id}</code>")
             
             remove_request(req_chat_id)
-        
+            return
+            
     except Exception as e:
         print(f"❌ Error en callback: {e}")
+        print(traceback.format_exc())
         health.record_error("callback", e)
 
 # ══════════════════════════════════════════════════════════════
@@ -662,46 +664,16 @@ def handle_callback(callback):
 
 app = Flask(__name__)
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Recibe updates de Telegram via webhook"""
-    try:
-        update = request.get_json()
-        health.update_activity()
-        
-        if "message" in update:
-            handle(update["message"])
-        
-        if "callback_query" in update:
-            handle_callback(update["callback_query"])
-            
-        return "OK", 200
-        
-    except Exception as e:
-        print(f"❌ Error webhook: {e}")
-        print(traceback.format_exc())
-        health.record_error("webhook", e)
-        return "ERROR", 500
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check para Koyeb"""
-    try:
-        stats = health.get_stats()
-        return jsonify(stats), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/', methods=['GET'])
-def home():
-    """Dashboard HTML"""
+@app.route("/")
+def index():
+    """Página principal - Panel de estado"""
     try:
         stats = health.get_stats()
         sys_info = get_system_info()
         
         html = f"""
 <!DOCTYPE html>
-<html>
+<html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -717,19 +689,17 @@ def home():
             font-family: 'Courier New', monospace;
             background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 100%);
             color: #00ff41;
-            padding: 20px;
             min-height: 100vh;
+            padding: 20px;
         }}
         .container {{
-            max-width: 900px;
+            max-width: 1200px;
             margin: 0 auto;
         }}
         .header {{
             text-align: center;
-            margin-bottom: 30px;
-            padding: 30px;
-            background: rgba(0, 255, 65, 0.05);
-            border: 2px solid #00ff41;
+            padding: 40px 20px;
+            background: rgba(0, 0, 0, 0.5);
             border-radius: 15px;
             box-shadow: 0 0 30px rgba(0, 255, 65, 0.3);
         }}
@@ -882,6 +852,38 @@ def home():
         
     except Exception as e:
         return f"Error: {str(e)}", 500
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """Endpoint webhook de Telegram"""
+    try:
+        health.update_activity()
+        
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"status": "error", "message": "No data"}), 400
+        
+        # Manejar mensajes
+        if "message" in data:
+            handle(data["message"])
+        
+        # Manejar callbacks
+        elif "callback_query" in data:
+            handle_callback(data["callback_query"])
+        
+        return jsonify({"status": "ok"}), 200
+        
+    except Exception as e:
+        print(f"❌ Error en webhook: {e}")
+        print(traceback.format_exc())
+        health.record_error("webhook", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/health")
+def health_check():
+    """Endpoint de salud"""
+    return jsonify(health.get_stats()), 200
 
 # ══════════════════════════════════════════════════════════════
 # SETUP WEBHOOK
