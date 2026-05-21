@@ -555,9 +555,59 @@ def establecer_lives(username, cantidad):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-def obtener_lives(username):
+def obtener_lives(limite=10, offset=0):
     """
-    Obtiene las lives (tarjetas) de un usuario
+    Obtiene tarjetas (lives) de Firebase con paginación
+    Args:
+        limite: número de tarjetas a obtener (por defecto 10)
+        offset: desde qué posición empezar (para paginación)
+    Retorna: dict con 'ok', 'tarjetas', 'total', 'tiene_mas'
+    """
+    try:
+        db = get_db()
+        
+        # Obtener todas las tarjetas de la colección
+        tarjetas_ref = db.collection('lives').document('anon').collection('tarjetas')
+        
+        # Contar total
+        all_docs = list(tarjetas_ref.stream())
+        total = len(all_docs)
+        
+        # Aplicar paginación
+        tarjetas = []
+        for i, doc in enumerate(all_docs):
+            if i < offset:
+                continue
+            if len(tarjetas) >= limite:
+                break
+                
+            tarjeta_data = doc.to_dict()
+            tarjeta_data['id'] = doc.id
+            tarjetas.append(tarjeta_data)
+        
+        # Verificar si hay más páginas
+        tiene_mas = (offset + limite) < total
+        
+        return {
+            "ok": True,
+            "tarjetas": tarjetas,
+            "total": total,
+            "tiene_mas": tiene_mas
+        }
+        
+    except Exception as e:
+        print(f"❌ Error obteniendo lives: {e}")
+        return {
+            "ok": False, 
+            "error": str(e),
+            "tarjetas": [],
+            "total": 0,
+            "tiene_mas": False
+        }
+
+def obtener_lives_usuario(username):
+    """
+    Obtiene las lives asignadas a un usuario específico
     Retorna: dict con 'ok', 'data' (lista de tarjetas), 'count'
     """
     try:
@@ -570,8 +620,6 @@ def obtener_lives(username):
         
         data = doc.to_dict()
         lives_count = data.get('lives_count', 0)
-        
-        # Si quieres devolver las tarjetas almacenadas (si las hay)
         lives = data.get('lives', [])
         
         return {
